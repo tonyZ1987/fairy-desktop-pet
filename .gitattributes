@@ -1,0 +1,27 @@
+# 行尾与编码约定
+#
+# 说明：脚本类文件（.vbs / .bat）必须是纯 ASCII + CRLF ——
+#   · .vbs 由 wscript 按 ANSI 解码，写成别的编码中文会乱；
+#   · cmd.exe 对 CRLF 更友好。
+# 源码与文档统一 UTF-8 + LF。
+#
+# 二进制资产不做任何转换。
+
+* text=auto
+
+*.py        text eol=lf
+*.md        text eol=lf
+*.txt       text eol=lf
+*.json      text eol=lf
+*.gitignore text eol=lf
+.gitignore  text eol=lf
+
+*.vbs       text eol=crlf
+*.bat       text eol=crlf
+
+*.npz       binary
+*.gif       binary
+*.png       binary
+*.jpg       binary
+*.mp4       binary
+*.ico       binary

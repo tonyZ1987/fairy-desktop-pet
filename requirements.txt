@@ -1,0 +1,9 @@
+# Fairy 桌面宠物 —— 运行依赖
+#
+# 只用到两个库：其余全部靠标准库 + ctypes 直调 Win32。
+# （本机实测版本：Pillow 12.3.0 / numpy 2.5.1）
+#
+# 装：pip install -r requirements.txt
+
+Pillow>=10.0
+numpy>=1.24
