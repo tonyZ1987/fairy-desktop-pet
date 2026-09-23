@@ -43,7 +43,9 @@ GLOW_PHASES = 180           # ★ 辉光相位表：180 帧 / 7.5 s = 24 fps。
                             #   每帧查表 ⇒ 运行时零计算。60 档 = 25ms/档，亮环每档移 0.8px。
                             #   内存 ≈ 60 × N² × 3 字节（260px 时 23MB）。想省内存就调小。
 DISC_HALF_U = 71.0          # 外盘+白描边裁剪块的半径（unit）
-BAKE_VERSION = 18            # ★ 烘焙格式版本：改过烘焙内容就 +1，否则会读到旧缓存
+BAKE_VERSION = 19            # ★ 烘焙格式版本：改过烘焙内容就 +1，否则会读到旧缓存
+#   v19（2026-09-22）：`dsh_mascot.glow_cover` 由 `clip(v/0.02)` 改成 `smoothstep(v/0.10)`
+#   ⇒ 扫描线（scan_a）是烘焙产物，必须重烘。
                              #   v18（2026-09-21 晚）= 工作态四层：底光 + 摩尔纹相位表 + 淡雾 mask
                             #   v17 = 烟团定稿为"② 差速剪切+拉丝"（剪切 2.60 / 拉丝 0.55）
                             #   v4 = 辉光合成内圈(去实心环) + 烟团湍流 + 亮底 alpha 增益
@@ -60,6 +62,14 @@ def _ds(a, ss):
     if a.ndim == 2:
         return a.reshape(n2, ss, n2, ss).mean(axis=(1, 3))
     return a.reshape(n2, ss, n2, ss, a.shape[2]).mean(axis=(1, 3))
+
+
+# ---- 烘焙进度：各段占总时间的比例（2026-09-22 实测 @200px，总 51.6 s）----
+#   ★ 只用于「把分段进度折成总进度」，不需要精确（进度条平滑即可）。
+#   ★★ 辉光占了 78.8% ⇒ 它的 180 次相位循环**必须**逐次报进度，否则进度条会跳。
+BAKE_SHARE = {"glow": 0.788, "moire": 0.050, "misc0": 0.900, "eye": 0.050}
+BAKE_LABEL = {u"glow": u"辉光相位表", u"moire": u"工作态摩尔纹", u"misc": u"外盘/扫描线/睫毛",
+              u"eye": u"眼睛呼吸相位", u"save": u"写入缓存"}
 
 
 def _u8(a):
@@ -89,11 +99,33 @@ def _solid(w, rgb):
     return Image.new("RGB", (w, w), bgr(rgb))
 
 
+def grid_n(pet_px, ss=2):
+    u"""超采样网格边长（含画布外扩）—— **不构造 FastMascot 也能算**。
+
+    ★★ 2026-09-23 抽出来（`FastMascot._grid_n` 现在直接调它）：主程序要在**烘焙之前**
+      就知道画布有多大 —— 倒计时窗 `Splash` 得按它定尺寸与居中位置，
+      而那时 `FairyPet` 还没建（烘焙就发生在它构造里）。
+      ⇒ 只能做成纯函数，否则两处各写一份公式、迟早漂移。
+    """
+    ppu = float(pet_px) / 160.0
+    m = M.canvas_margin_px(ppu)
+    n = int(round(160 * ppu * ss)) + 2 * m * ss
+    return ((n + ss - 1) // ss) * ss
+
+
+def canvas_px(pet_px, ss=2):
+    u"""画布边长（= 窗口边长，像素）。本体 `pet_px` 之外每边多留一圈辉光余量。
+
+    实测：200→284 ｜ 260→370 ｜ 320→456（三者都会被 `SIZES` 用到）。
+    """
+    return grid_n(pet_px, ss) // ss
+
+
 class FastMascot:
     """size = 显示边长（px）。第一次构造会烘焙并写盘缓存（约 7 s），之后秒开。"""
 
     def __init__(self, size=260, ss=2, halo_gain=1.0, cache_dir=None, verbose=False,
-                 tag=None):
+                 tag=None, bake_progress=None):
         """size = **宠物本体**的像素尺寸（用户选的显示尺寸）。
         画布比它大：每边多留 CANVAS_MARGIN_U × ppu 像素，给辉光留出发散空间 ⇒ self.N 是画布边长。"""
         self.pet_px = int(size)
@@ -109,6 +141,8 @@ class FastMascot:
         #   tag=None ⇒ 取 dsh_mascot.GLOW_TAG；为空时**文件名与旧版完全一致**（生产缓存不受影响）。
         self.tag = M.GLOW_TAG if tag is None else str(tag)
         self.tag = "".join(c for c in self.tag if c.isalnum() or c in "_-")
+        self._work_cut_a = None          # 工作态外缘收缩包络（载入后算，见 _apply_work_cut）
+        self._work_cut_ms = 0.0
         import time as _t
         t0 = _t.perf_counter()
         if cache_dir:
@@ -120,19 +154,55 @@ class FastMascot:
             if os.path.exists(p):
                 try:
                     self._load(p)
+                    self._work_cut_ms = self._apply_work_cut()   # ★ 见方法注释：不用重烘
                     self._make_pil()
                     if verbose:
                         print("[fast] 缓存载入 %.2fs" % (_t.perf_counter() - t0))
                     return
                 except Exception as e:
                     print("[fast] 缓存不可用，重烘：%r" % (e,))
-            self._bake()
+            self._bake(bake_progress)
             self._save(p)
         else:
-            self._bake()
+            self._bake(bake_progress)
+        self._work_cut_ms = self._apply_work_cut()
         self._make_pil()
         if verbose:
             print("[fast] 烘焙完成 %.1fs  size=%d" % (_t.perf_counter() - t0, self.N))
+
+    # ------------------------------------------------------------ 工作态外缘收缩
+    def _apply_work_cut(self):
+        """把 `M.work_cut(rho)` 乘进**已烘焙**的工作态三层数组（载入/烘焙之后、`_make_pil` 之前）。
+
+        ★★ 为什么可以放在这里、**不必重烘**（也就不必动 `BAKE_VERSION`）：
+           包络是对"最终烘焙结果"做**逐像素径向乘**；而 alpha 的亮度查表（`_alpha_lut`）
+           同样是**逐像素**函数 ⇒ "先乘色、再查表" 与 "把包络烘进 `work_bg_layer` /
+           `work_moire_layer` / `mist_mask` 再查表" 得到的是同一条曲线（只差一个单调映射）。
+           ⇒ **改收缩强度只要重启**：主人可以当场试几档，不用等 5 分钟重烘。
+           （注意：**别**把包络也烘进 `dsh_mascot` 的层函数，那会乘两遍。）
+        """
+        a = self._work_cut_mask()
+        if a is None:
+            return 0.0
+        import time as _t
+        t0 = _t.perf_counter()
+        self.work_bg_rgb = np.clip(self.work_bg_rgb.astype(np.float32) * a[..., None],
+                                   0.0, 255.0).astype(np.uint8)
+        self.moire_phases = np.clip(self.moire_phases.astype(np.float32) * a[None, :, :, None],
+                                    0.0, 255.0).astype(np.uint8)
+        self.mist_mask = np.clip(self.mist_mask.astype(np.float32) * a, 0.0, 255.0).astype(np.uint8)
+        self._work_cut_a = a
+        return (_t.perf_counter() - t0) * 1000.0
+
+    def _work_cut_mask(self):
+        """工作态外缘收缩包络（N×N float32），与烘焙产物**逐像素对齐**；强度全 1 时返回 None。"""
+        if not M.work_cut_active():
+            return None
+        c = (self.N - 1) / 2.0
+        yy, xx = np.mgrid[0:self.N, 0:self.N]
+        rho = np.sqrt((xx - c) ** 2 + (yy - c) ** 2) / (M.GLOW_R_DISC * self.ppu)
+        m = M.work_cut(rho).astype(np.float32)
+        return None if float(m.min()) >= 0.999 else m
 
     # ------------------------------------------------------------------ 裁剪
     def _margin_px(self):
@@ -141,8 +211,7 @@ class FastMascot:
 
     def _grid_n(self, ss):
         # ★ 含外扩：画布在 160 unit 视图之外每边多留 margin 像素，给辉光留发散空间
-        n = int(round(160 * self.ppu * ss)) + 2 * self._margin_px() * ss
-        return ((n + ss - 1) // ss) * ss
+        return grid_n(self.pet_px, ss)
 
     def _grid_center(self, ss):
         """宠物中心在 ss 网格里的坐标。★ 必须与网格严格一致，否则裁剪框整体错 1px。"""
@@ -161,7 +230,12 @@ class FastMascot:
         return i0, w
 
     # ------------------------------------------------------------------ 烘焙
-    def _bake(self):
+    def _bake(self, on_progress=None):
+        """烘焙全部层。`on_progress(fraction, label)` —— fraction 是 0~1 的**总**进度。
+
+        ★ 默认 None ⇒ 与改造前逐位相同（只是多几次函数调用）。
+        ★ 主程序可在这里面刷启动动画：**每调用一次 = 一个可插帧的点**。
+        """
         r = M.DSHSvg(px_per_unit=self.ppu, ss=self.ss)
         x, y = r.x, r.y
         n = r.n
@@ -175,6 +249,8 @@ class FastMascot:
         for k in range(K):
             gl = M.glow_layer(x, y, phase=k / K) * g
             gp[k] = _u8rgb(_ds(gl, self.ss))[..., ::-1]        # → BGR
+            if on_progress is not None:                        # ★ 逐相位报（占全程 79%）
+                on_progress(BAKE_SHARE["glow"] * (k + 1) / float(K), BAKE_LABEL["glow"])
         self.glow_phases = gp
 
         # ---- ①c ★ 工作态三层（2026-09-21 晚，主人："加摩尔纹 + 淡色的雾 + 数字背后的光源"）----
@@ -189,6 +265,9 @@ class FastMascot:
         for k in range(Km):
             mo = M.work_moire_layer(x, y, phase=k / float(Km)) * g
             mp[k] = _u8rgb(_ds(mo, self.ss))[..., ::-1]                     # → BGR
+            if on_progress is not None:
+                on_progress(BAKE_SHARE["glow"] + BAKE_SHARE["moire"] * (k + 1) / float(Km),
+                            BAKE_LABEL["moire"])
         self.moire_phases = mp
         #   淡雾 mask = **辉光的 alpha × WORK_MIST_K**（逐像素同源 ⇒ 辉光怎么动，雾就怎么动）
         #   注：gp[0] 已是 BGR，但 max(axis=2) 与通道序无关。
@@ -197,6 +276,8 @@ class FastMascot:
         #      所以必须先 /255 —— 否则整个辉光区被 clip 成 mask=255 ⇒ 雾变成"辉光整幅贴上"，
         #      现象是"工作态亮得跟常态一样"＋参考/实时 MAE 从 1.7 飙到 8.5。
         self.mist_mask = _u8(M.work_mist_alpha(gp[0].astype(np.float64)) / 255.0)
+        if on_progress is not None:
+            on_progress(BAKE_SHARE["misc0"], BAKE_LABEL["misc"])
 
         # ---- ①b 外盘渐变 + 白描边：静态，裁成小块（半径 DISC_HALF_U）叠在辉光之上 ----
         ga = np.array([0.2 * 160, 0.0]); gb = np.array([0.8 * 160, 160.0]); v = gb - ga
@@ -254,6 +335,9 @@ class FastMascot:
             rgb, a1 = self._eye_layers(xe, ye, rre, sc, r)
             stack[k, ..., :3] = _u8rgb(_ds(rgb, self.ss))[..., ::-1]     # → BGR
             stack[k, ..., 3] = _u8(_ds(a1, self.ss))
+            if on_progress is not None:
+                on_progress(BAKE_SHARE["misc0"] + BAKE_SHARE["eye"] * (k + 1) / float(PHASES),
+                            BAKE_LABEL["eye"])
         self.eye_stack = stack
 
         # ---- ⑥ 眼睑遮罩的基函数（G / H，与 mid 无关）----
@@ -266,6 +350,8 @@ class FastMascot:
         self.lid_G = _f32(np.interp(yu, cx, (1 - t) ** 2 + t ** 2))[None, :]
         self.lid_H = _f32(np.interp(yu, cx, 2 * t * (1 - t)))[None, :]
         self.lid_bot = _f32(np.clip(0.5 + (yu - 108.0) / FEATHER, 0.0, 1.0))[:, None]
+        if on_progress is not None:
+            on_progress(1.0, BAKE_LABEL["save"])
 
     def _eye_layers(self, xe, ye, rre, sc, r):
         """照抄参考实现第 4 节：眼睛各层。返回 (rgb_over_black, alpha)"""
@@ -521,7 +607,14 @@ class FastMascot:
         """
         cv = cv if cv is not None else self._canvas
         arr = np.asarray(cv, dtype=np.uint8)
-        alpha = arr.max(axis=2)
+        # ★★ 2026-09-22（高分屏计划的副产品）：`arr.max(axis=2)` → 三次 `np.maximum`，
+        #   **实测快 18 倍、结果逐像素一致**。
+        #   原因：numpy 对**长度为 3 的轴**做 reduce 走的是极慢的通用路径 ——
+        #     260px 档 3.04 ms（占装箱 75%）⇒ 0.16 ms；520px 档 11.54 ms（占 71%）⇒ 0.63 ms。
+        #   ★ 这是纯 numpy 反模式，与画质无关；当年写 `max(axis=2)` 是"看起来更清楚"，其实是坑。
+        #   ★★ 以后再写"沿最后一维（通道）聚合"的操作，**一律手工展开**，别用 reduce。
+        alpha = np.maximum(arr[..., 0], arr[..., 1])
+        np.maximum(alpha, arr[..., 2], out=alpha)
         # ★ 亮底"凝实"：alpha 过一遍**亮度查表**（alpha → alpha + (255-alpha)·k·(alpha/255)^p）。
         #   黑底显示的是预乘色 ⇒ 这一步**完全不改变暗色桌面上的样子**；
         #   亮底显示 = 预乘色 + (1-alpha)×背景 ⇒ 白渗漏变少 = 浅色界面上更显形、更成团。

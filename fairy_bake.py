@@ -23,7 +23,7 @@ print("BAKE_VERSION = %d ｜ 辉光相位 %d ｜ 摩尔纹相位 %d ｜ 数字 %
       flush=True)
 for sz in sizes:
     t0 = time.perf_counter()
-    fm = FastMascot(size=sz, ss=2, cache_dir="_cache")
+    fm = FastMascot(size=sz, ss=2, cache_dir=os.path.join(HERE, "_cache"))
     dt = time.perf_counter() - t0
     print("  %3d px ｜ 画布 %d ｜ %.1f s" % (sz, fm.N, dt), flush=True)
     del fm

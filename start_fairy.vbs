@@ -8,6 +8,12 @@ Set fso = CreateObject("Scripting.FileSystemObject")
 
 base = fso.GetParentFolderName(WScript.ScriptFullName)
 pyw = FindPy("pythonw.exe")
+If pyw = "" Then
+    MsgBox "Python not found." & vbCrLf & vbCrLf & _
+           "Create a file named python_path.txt next to this script and put" & vbCrLf & _
+           "the full path of python.exe (or its folder) in it, then try again.", 16, "Fairy"
+    WScript.Quit 1
+End If
 script = base & "\fairy_pet.py"
 beat = base & "\heartbeat.txt"
 
@@ -48,73 +54,104 @@ If Not ok Then
            "front instead of starting a second one.)", 48, "Fairy"
 End If
 
-' ---------------------------------------------------------------------------
-' FindPy: locate python.exe / pythonw.exe WITHOUT hard-coding any path.
+' === Fairy launcher probe (managed by pet-v2/_work/fix_launchers.py) ===
+' Locate python.exe / pythonw.exe without hard-coding a machine path.
+' Order: %FAIRY_PYTHON% -> python_path.txt beside this script -> WorkBuddy managed venv
+'        -> other managed python -> %PATH% -> common install folders.
+' python_path.txt may hold a FOLDER or a full path to python.exe - both work.
 '
-' Order:  %FAIRY_PYTHON%  ->  python_path.txt next to this script  ->  %PATH%
-'         ->  the standard install locations.
-'
-' Kept in a Function (rather than inline) on purpose: every variable here is
-' function-local, so it cannot clash with the caller's names under
-' "Option Explicit" (inline Dim of an already-declared name is a hard error).
-'
-' If your Python is in a non-standard place (e.g. a portable build), either
-' set the environment variable FAIRY_PYTHON to the full path of pythonw.exe,
-' or drop a one-line python_path.txt next to this script containing the path.
-' ---------------------------------------------------------------------------
-Function FindPy(exeName)
-    Dim fso, sh, c, r, roots, s, here, tf, ts
-    Set fso = CreateObject("Scripting.FileSystemObject")
-    Set sh = CreateObject("WScript.Shell")
-
-    ' 1) explicit override via environment variable
-    c = sh.ExpandEnvironmentStrings("%FAIRY_PYTHON%")
-    If c <> "%FAIRY_PYTHON%" And fso.FileExists(c) Then
-        FindPy = c
+Function PyFromPath(sFrom, sWant)
+    Dim sD, sN
+    PyFromPath = ""
+    If sFrom = "" Then Exit Function
+    sD = sFrom
+    If Right(sD, 1) = "\" Then sD = Left(sD, Len(sD) - 1)
+    If fso.FolderExists(sD) Then
+        If fso.FileExists(sD & "\" & sWant) Then PyFromPath = sD & "\" & sWant
         Exit Function
     End If
-
-    ' 2) a one-line python_path.txt sitting next to this script
-    here = fso.GetParentFolderName(WScript.ScriptFullName)
-    tf = here & "\python_path.txt"
-    If fso.FileExists(tf) Then
-        Set ts = fso.OpenTextFile(tf, 1)
-        c = Trim(ts.ReadLine)
-        ts.Close
-        If Len(c) > 0 And fso.FileExists(c) Then
-            FindPy = c
-            Exit Function
-        End If
+    sN = fso.GetParentFolderName(sD)
+    If sN <> "" Then
+        If fso.FileExists(sN & "\" & sWant) Then PyFromPath = sN & "\" & sWant
     End If
+End Function
 
-    ' 3) anywhere on PATH
-    For Each c In Split(sh.ExpandEnvironmentStrings("%PATH%"), ";")
-        c = Trim(c)
-        If Len(c) > 1 Then
-            If Right(c, 1) = "\" Then c = Left(c, Len(c) - 1)
-            If fso.FileExists(c & "\" & exeName) Then
-                FindPy = c & "\" & exeName
-                Exit Function
-            End If
-        End If
-    Next
-
-    ' 4) the usual install locations (only dirs whose name contains "Python")
-    roots = Array(sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Programs\Python"), _
-                  sh.ExpandEnvironmentStrings("%ProgramFiles%"), _
-                  sh.ExpandEnvironmentStrings("%ProgramFiles(x86)%"))
-    For Each r In roots
-        If fso.FolderExists(r) Then
-            For Each s In fso.GetFolder(r).SubFolders
-                If InStr(1, s.Name, "Python", 1) > 0 Then
-                    If fso.FileExists(s.Path & "\" & exeName) Then
-                        FindPy = s.Path & "\" & exeName
+Function FindPyIn(aRoots, sWant, bScriptsOnly)
+    Dim sRoot, oSub, sHit
+    FindPyIn = ""
+    For Each sRoot In aRoots
+        If fso.FolderExists(sRoot) Then
+            For Each oSub In fso.GetFolder(sRoot).SubFolders
+                If bScriptsOnly Then
+                    sHit = oSub.Path & "\Scripts\" & sWant
+                    If fso.FileExists(sHit) Then
+                        FindPyIn = sHit
+                        Exit Function
+                    End If
+                Else
+                    sHit = oSub.Path & "\" & sWant
+                    If fso.FileExists(sHit) Then
+                        FindPyIn = sHit
+                        Exit Function
+                    End If
+                    sHit = oSub.Path & "\Scripts\" & sWant
+                    If fso.FileExists(sHit) Then
+                        FindPyIn = sHit
                         Exit Function
                     End If
                 End If
             Next
         End If
     Next
+End Function
 
+Function FindPy(sWant)
+    Dim sEnv, sCand, sTxt, oTS, aParts, aRoots, sDir, iPy
     FindPy = ""
+    sEnv = sh.ExpandEnvironmentStrings("%FAIRY_PYTHON%")
+    If sEnv <> "%FAIRY_PYTHON%" Then
+        sCand = PyFromPath(sEnv, sWant)
+        If sCand <> "" Then
+            FindPy = sCand
+            Exit Function
+        End If
+    End If
+    sTxt = base & "\python_path.txt"
+    If Not fso.FileExists(sTxt) Then sTxt = fso.GetParentFolderName(base) & "\python_path.txt"
+    If fso.FileExists(sTxt) Then
+        Set oTS = fso.OpenTextFile(sTxt, 1)
+        If Not oTS.AtEndOfStream Then sCand = Trim(oTS.ReadLine)
+        oTS.Close
+        sCand = PyFromPath(sCand, sWant)
+        If sCand <> "" Then
+            FindPy = sCand
+            Exit Function
+        End If
+    End If
+    aRoots = Array( _
+        sh.ExpandEnvironmentStrings("%USERPROFILE%") & "\.workbuddy\binaries\python\envs", _
+        sh.ExpandEnvironmentStrings("%USERPROFILE%") & "\.workbuddy\binaries\python\versions")
+    sCand = FindPyIn(aRoots, sWant, True)
+    If sCand = "" Then sCand = FindPyIn(aRoots, sWant, False)
+    If sCand <> "" Then
+        FindPy = sCand
+        Exit Function
+    End If
+    aParts = Split(sh.ExpandEnvironmentStrings("%PATH%"), ";")
+    For iPy = 0 To UBound(aParts)
+        sDir = Trim(aParts(iPy))
+        If sDir <> "" Then
+            If Right(sDir, 1) = "\" Then sDir = Left(sDir, Len(sDir) - 1)
+            If fso.FileExists(sDir & "\" & sWant) Then
+                FindPy = sDir & "\" & sWant
+                Exit Function
+            End If
+        End If
+    Next
+    aRoots = Array( _
+        sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\Programs\Python", _
+        sh.ExpandEnvironmentStrings("%ProgramFiles%"), _
+        sh.ExpandEnvironmentStrings("%ProgramFiles(x86)%"))
+    sCand = FindPyIn(aRoots, sWant, False)
+    If sCand <> "" Then FindPy = sCand
 End Function
