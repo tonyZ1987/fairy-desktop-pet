@@ -41,9 +41,65 @@ import os
 import time
 
 DEFAULT_ROOT = os.path.join(os.path.expanduser("~"), ".workbuddy", "projects")
+HERE = os.path.dirname(os.path.abspath(__file__))
+# ★★ 2026-09-23 主人：「我会让 workbuddy 同时开两个或以上任务在工作，你只监控 fairy
+#   项目这边或者只监视 20260920 这边，**不要混淆**」。
+#   ⇒ 这个文件指定要盯哪些项目（一行一个目录名，`#` 开头是注释）：
+#         pet-v2\activity_project.txt
+#     不写它 ⇒ **自动认本仓库所在的那个项目**（见 `project_key()`）。
+ONLY_FILE = os.path.join(HERE, "activity_project.txt")
+
+
+def project_key(path):
+    u"""项目根路径 → WorkBuddy 的 `projects` 目录名。
+
+    实测规则（2026-09-23 本机）：
+        E:\\AI成图实践\\Fairy           → `e-AI成图实践-Fairy`
+        D:\\郑丁铭\\…\\PDF\\20260920     → `d-郑丁铭-…-PDF-20260920`
+    即 **盘符小写** + 其余路径把分隔符换成 `-`。
+    """
+    p = os.path.abspath(path)
+    drive, rest = os.path.splitdrive(p)
+    return (drive.rstrip(u":").lower() + u"-"
+            + rest.strip(u"\\/").replace(u"\\", u"-").replace(u"/", u"-"))
+
+
+def config_only(path=ONLY_FILE, repo_root=None):
+    u"""→ 要监控的项目目录名列表（**空列表 = 不限制**）。
+
+    优先级：`activity_project.txt` > **自动推导本仓库所在项目** > 不限（兜底）。
+    ★ 自动推导不会失手到"什么都监控不到"：`ActivityWatch._match` 用的是**双向前缀**
+      匹配，所以哪怕跑的是发布副本（目录名 `fairy-desktop-pet` 与项目根不同名），
+      `e-AI成图实践-Fairy` 照样命中。
+    """
+    names = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln and not ln.startswith("#"):
+                    names.append(ln)
+    except Exception:
+        pass
+    if names:
+        return names
+    root = repo_root or os.path.dirname(HERE)
+    return [project_key(root)]
 
 EXIT_S = 8.0         # 末事件无定论时：安静超过这个秒数 ⇒ 认为已收工
-HOLD_S = 20.0        # ★★ 主人提交指令后的"保持窗口"（见 `active()`，用来消掉"中途闪回常态"）
+HOLD_S = 60.0        # ★★ 主人提交指令后的"保持窗口"（见 `active()`，用来消掉"中途闪回常态"）
+                     #   ★ 2026-09-23： 20 → 60。主人发完指令到我产出**第一个信号**
+                     #     （`reasoning` 或 `function_call`）之间有一段**纯思考空档**，
+                     #     原来 20 s 偶尔不够 ⇒ 观感就是"刚发完指令，它又睁眼了"。
+                     #   ★★ 另有一个前提：`_hold_until` 只在 `active()` 里更新 ⇒
+                     #     调用方**必须真的调它**（`fairy_pet._target_state()` 踩过这个坑）。
+ASSIST_HOLD_S = 25.0  # ★★ 2026-09-23 主人抓到「半睁 → 睁眼 → 又半睁，过程有反复」：
+                     #   原来一见 `message/assistant`（我开口说话）就**立刻关窗**，
+                     #   理由是"很可能就是最终答复"。但一回合里我**会说好几段、中间夹工具调用**
+                     #   ⇒ 每说一段就关窗、8 s 后睁眼，我接着干活又半睁 ⇒ **抖**。
+                     #   ⇒ 改成"把窗口**缩到** 25 s"：说完话仍有缓冲，我继续干活会重新开窗。
+                     #   ★ 这就是主人要的语义 ——「从进入工作态起就保持，一直到你回复结束」，
+                     #     这 25 s 是"最后一段话之后的尾巴"。
 SCAN_S = 1.0         # 目录扫描间隔（没必要每帧扫）
 TAIL_BYTES = 524288  # 读文件尾部多少字节来找最后一条事件（推理段落可能很长）
 
@@ -51,18 +107,35 @@ TAIL_BYTES = 524288  # 读文件尾部多少字节来找最后一条事件（推
 HARD_WORK = ("function_call", "reasoning")
 # 末尾是这些 ⇒ 必须靠时间判断
 SOFT = ("function_call_result", "message", "file-history-snapshot", None)
+# ★★★ 2026-09-23 **只认这些类型**，其余（`file-history-snapshot` 等 harness 记账）一律**跳过**。
+#   真根因：实测 `file-history-snapshot` 会**紧跟主人那条 user 消息之后**写进来
+#   （16:41:38 user → 16:41:38 snapshot），而我**纯思考 3 分钟、jsonl 一个字都不写**
+#   ⇒ 感知看到的"末事件"是那个记账事件 ⇒ 掉进「安静 8 s 算收工」
+#   ⇒ 主人等我思考的那 3 分钟里桌宠**一直是常态**。
+MEANINGFUL = ("message", "function_call", "function_call_result", "reasoning")
 
 
 class ActivityWatch:
-    def __init__(self, root=None, exit_=EXIT_S, scan=SCAN_S, hold=HOLD_S):
+    def __init__(self, root=None, exit_=EXIT_S, scan=SCAN_S, hold=HOLD_S, only=None,
+                 assist_hold=ASSIST_HOLD_S):
         self.root = root or DEFAULT_ROOT
         self.exit = float(exit_)
         self.scan = float(scan)
         self.ok = os.path.isdir(self.root)
+        self.hold = float(hold)
+        self.assist_hold = float(assist_hold)   # ★ 我说完话之后的保持窗口（见 `ASSIST_HOLD_S`）
+        # ★★ 只盯这些项目（空 = 全部）。见文件顶部 `config_only()` 的说明 ——
+        #   同时开多个任务时，不限定就会"谁在动就跟谁"，必然混淆。
+        self.only = list(only) if only is not None else config_only()
+        self.skipped = 0             # 诊断：这一轮被"项目过滤"挡掉了几个目录
         self.last_act = 0.0          # 最近一次活动的墙钟时间
         self.last_file = ""          # 诊断：哪个会话文件在动
-        self.last_type = ""          # 诊断：末尾事件类型
+        self.last_type = ""          # 诊断：末尾事件类型（已跳过 harness 记账类）
         self.last_role = ""          # 诊断：末尾事件 role
+        # ★ 2026-09-23：尾部**最近一条 message** 的角色 —— 判"他还在等我"用（见 `active()`）
+        self.last_msg_role = None
+        # ★ 末事件**落盘时刻**（墙钟）—— 保持窗口用它算，用 `now` 会让窗口永不过期
+        self._ev_at = 0.0
         self._hold_until = 0.0       # ★ 新指令后的"保持窗口"终点（见 active()）
         self.hold = float(hold)
         self.hint = "init"           # 诊断：这一轮判定的依据
@@ -87,11 +160,31 @@ class ActivityWatch:
         except Exception:
             self._subdirs = []
 
+    def _match(self, dirname):
+        u"""这个项目目录在不在白名单里（**双向前缀**匹配）。
+
+        ★ 为什么用前缀、不用相等：WorkBuddy 的目录名**会被截断**
+          （实测见过 `c-Users-…-2026-08-04-15-` 这种尾部带 `-` 的），
+          而且"发布副本"跑起来时仓库名可能是项目名 + 后缀 ⇒ 两边都放宽最稳。
+        """
+        if not self.only:
+            return True
+        d = dirname.lower()
+        for w in self.only:
+            w = w.lower()
+            if d == w or d.startswith(w) or w.startswith(d):
+                return True
+        return False
+
     def _newest(self, now):
-        """返回 (最新 jsonl 路径, 其 mtime)。"""
+        u"""返回 (最新 jsonl 路径, 其 mtime)。★ 只扫白名单里的项目（见 `only`）。"""
         self._refresh_dirs(now)
         best, best_p = 0.0, ""
+        self.skipped = 0
         for d in self._subdirs:
+            if not self._match(os.path.basename(d)):
+                self.skipped += 1
+                continue                      # ★ 别的项目在动 ⇒ 与我无关，不看
             try:
                 with os.scandir(d) as it:
                     for e in it:
@@ -112,7 +205,18 @@ class ActivityWatch:
 
     @staticmethod
     def _tail_event(path):
-        """读文件尾部，返回最后一条完整事件 (type, role)。失败 → (None, None)。"""
+        u"""读文件尾部 → `(末事件类型, role, 最近一条 message 的 role)`；失败 → 三个 None。
+
+        ★★★ 2026-09-23 **真根因**（主人：「等了很久，看来这个 bug 你还是没修好」）：
+          实测 `file-history-snapshot` 会**紧跟在主人那条 user 消息之后**写进来
+          （16:41:38 user → 16:41:38 snapshot），而我**纯思考 3 分钟、jsonl 一个字都不写**
+          ⇒ 感知看到的"末事件"是那个记账事件、既不是硬判据也不是 user
+          ⇒ 掉进「安静 8 s 算收工」⇒ **主人等我思考的那 3 分钟里桌宠一直是常态**。
+
+        ⇒ 两条修法：
+          ① 只认白名单 `MEANINGFUL` 里的类型，harness 记账类一律**跳过**；
+          ② 顺手带回"最近一条 `message` 的 role" —— 用它判"他还在等我"（见 `active()`）。
+        """
         try:
             with open(path, "rb") as f:
                 f.seek(0, 2)
@@ -121,7 +225,8 @@ class ActivityWatch:
                 f.seek(size - n)
                 data = f.read(n)
         except Exception:
-            return None, None
+            return None, None, None
+        last_msg_role = None
         for raw in reversed(data.split(b"\n")):
             raw = raw.strip()
             if not raw.startswith(b"{"):
@@ -133,8 +238,12 @@ class ActivityWatch:
             # role 可能在顶层，也可能在嵌套的 message 里（两种写法都见过）
             msg = d.get("message")
             role = d.get("role") or (msg.get("role") if isinstance(msg, dict) else None)
-            return d.get("type"), role
-        return None, None
+            t = d.get("type")
+            if last_msg_role is None and t == "message":
+                last_msg_role = role          # ★ 尾部**最近一条** message 的角色
+            if t in MEANINGFUL:
+                return t, role, last_msg_role
+        return None, None, last_msg_role
 
     # ---------------------------------------------------------------- 对外
     def age(self, now=None):
@@ -153,7 +262,10 @@ class ActivityWatch:
             self._scan_at = now
             path, mt = self._newest(now)
             if path:
-                self.last_type, self.last_role = self._tail_event(path)
+                (self.last_type, self.last_role,
+                 self.last_msg_role) = self._tail_event(path)
+                # ★ 记住"这条末事件是什么时候落盘的" —— 保持窗口必须用它来算（见下）
+                self._ev_at = mt
         age = self.age(now)
         t, r = self.last_type, self.last_role
 
@@ -170,16 +282,40 @@ class ActivityWatch:
         #   ⇒ 见到 `message/user` **开窗 20 s**（窗口内无定论也保持工作态）；
         #     见到 `message/assistant`（我在说话＝很可能就是最终答复）**立刻关窗** ——
         #     这样既消掉闪回，也不会出现"三句话的回答也让桌宠半睁 20 秒"。
+        # ★★★ 窗口一律用**事件落盘时刻** `_ev_at` 算，**绝不能用 `now`**：
+        #   用 `now` 的话，桌宠每秒扫一次就把窗口往后推一次 ⇒ **窗口永不过期**
+        #   ⇒ 桌宠会"一直半睁、永不回常态"。这个反向 bug 被 `_settled` 掩盖了很久，
+        #   2026-09-23 做时序测试（`_work/v2_41_verify_snapshot.py`）才暴露出来。
+        _ev = self._ev_at or now
         if t == "message" and r == "user":
-            self._hold_until = max(self._hold_until, now + self.hold)
+            self._hold_until = max(self._hold_until, _ev + self.hold)
         elif t == "message" and r == "assistant":
-            self._hold_until = 0.0
+            # ★★ 2026-09-23 主人抓到「半睁 → 睁眼 → 又半睁，过程有反复」。
+            #   原来这里是 `= 0.0`（**立刻关窗**，理由是"我开口说话 ≈ 最终答复"），
+            #   可一个回合里我**会说好几段、中间还夹着工具调用** ⇒ 每说一段就关窗、
+            #   8 s（`EXIT_S`）后睁眼，我接着干活又半睁 ⇒ **抖**。
+            #   ⇒ 改成"把窗口**缩到** `ASSIST_HOLD_S`"（**赋值**，不是清零）：
+            #     说完话仍有 25 s 缓冲；我继续干活（新事件）会把窗口重新拉长。
+            #   ★ 主人要的语义：「从进入工作态起就保持，一直到你回复结束」——
+            #     这 25 s 就是"最后一段话之后的尾巴"，之后自然回常态。
+            self._hold_until = max(self._hold_until, _ev + self.assist_hold)
 
         if t in HARD_WORK:
             self.hint = "%s（硬判据）" % t
             return True
         if t == "message" and r == "user":
             self.hint = "user 刚提交"
+            return True
+        # ★★★ 2026-09-23：**本轮最后一条 message 是主人说的** ⇒ 他还在等我
+        #   ⇒ 一律工作态（**完全不看时间**）。
+        #   为什么非要这条：主人发完消息后 harness 会**紧跟一条 `file-history-snapshot`**，
+        #   而"我纯思考的那几分钟 jsonl 一个字都不写" ⇒ 末事件既不是 user、也不是硬判据
+        #   ⇒ 掉进"安静 8 s 算收工" ⇒ 主人 16:41:38 问话、一直等到 16:44:40 我才有下一条事件，
+        #     **那 3 分钟里桌宠一直是常态**。
+        #   ★ 这正是主人要的语义：「从进入工作态起就保持，一直到你回复结束」——
+        #     "我回复" = 尾部最近一条 message 变成 assistant（我开口说话）。
+        if self.last_msg_role == "user":
+            self.hint = u"最后一条消息是主人 ⇒ 还在等他（%s/%.1fs）" % (t or u"?", age)
             return True
         if now < self._hold_until:
             self.hint = "保持窗口内（%s/%.1fs）" % (t or "?", age)
@@ -188,9 +324,16 @@ class ActivityWatch:
         return age < self.exit
 
     def info(self):
-        """给 heartbeat 用的一行诊断。"""
+        u"""给 heartbeat 用的一行诊断。
+
+        ★ 2026-09-23 起带上"在盯哪个项目、挡掉了几个目录" —— 同时开多个任务时，
+          排障第一件事就是确认"它有没有在看别的项目"。
+        """
         a = self.age()
-        return "%s|%s|%.1fs" % (self.last_type or "-", self.hint, a if a < 1e6 else -1)
+        proj = ((u"%d个项目" % len(self.only)) if len(self.only) != 1
+                else self.only[0]) if self.only else u"全部"
+        return "%s|%s|%.1fs|%s,挡%d" % (self.last_type or "-", self.hint,
+                                        a if a < 1e6 else -1, proj, self.skipped)
 
 
 if __name__ == "__main__":

@@ -492,6 +492,19 @@ class FairyPet:
         #         ② `DONE_SETTLE_S` 秒后**自己回常态**（主人："过 10 秒后切换到正常态"）。
         self.prog_settle = False        # progress.json 里的 settle 标记
         self._done_seen_at = None       # 首次看到"已交付"的时刻（计时用）
+        # ★★ 2026-09-23：记下"**已经计过时**的那条 settle 记录的 mtime"。
+        #   为什么需要它：原来用 `_done_seen_at is None` 当"首次"判据，
+        #   而主人一开口我们就把 `_done_seen_at` 清掉、progress.json 却仍是那条 settle
+        #   ⇒ 下一轮又判"首次"、又计时 ⇒ 收尾态反复挂上（主人抓到的那个 bug）。
+        #   ★★ 启动时**直接认成"已消费"**（取启动那一刻 progress.json 的 mtime）：
+        #     否则重启后会把上一轮那条 `--reply` 的 settle 当成本轮的 ⇒ 一起机就挂 100%
+        #     （主人 2026-09-23：「为啥我重启后直接变工作态了」）。
+        try:
+            self._settle_mtime = os.path.getmtime(PROGRESS_FILE)
+        except Exception:
+            self._settle_mtime = 0.0
+        # ★★ 冷启动时刻（墙钟）：`_cold_boot()` 用它判断"启动后有没有人来搭理过我"。
+        self._boot_at = time.time()
         self._settled = False           # 已交付超 DONE_SETTLE_S ⇒ 强制常态，直到下一轮开工
         self.prog_poll_at = 0.0
         self._prog_mtime = 0.0      # progress.json 的最后写入时间（判"是不是这一轮新上报的"）
@@ -921,6 +934,52 @@ class FairyPet:
             log_err("typing_probe", e)
             return False
 
+    def _settle_idle_state(self):
+        u"""收尾**真的结束**（主人开始打字 / 挂满 `DONE_SETTLE_S`）时，把 `state.json` 写成 idle。
+
+        ★★ **别让文件撒谎**：原来只有内部切常态、文件一直写着 working，
+          害我在真机自检里误判过一轮（`_work/step137`）。只写这一次，不是每帧。
+        ★ 只在**真的收尾**那两条路上调用；「主人开口」那条**不写** ——
+          他马上就是新一轮工作，这时候写 idle 才是撒谎。
+        ★ 也不能写早：写早了 `state.json` 就说 idle，而 `_target_state()` 拿它当
+          `auto_state` ⇒ 100% 会提前消失。
+        """
+        try:
+            _tmp = STATE_FILE + ".tmp"
+            with open(_tmp, "w", encoding="utf-8") as _f:
+                json.dump({"state": "idle",
+                           "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                           "ttl": 2700, "note": u"交付完成，自动回常态"},
+                          _f, ensure_ascii=False)
+            os.replace(_tmp, STATE_FILE)
+        except Exception as e:
+            log_err("settle_write_state", e)
+
+    def _cold_boot(self):
+        u"""**刚起来、还没人来搭理**？—— 是的话一律常态。
+
+        ★★ 2026-09-23 主人：「为啥我重启后直接变工作态了，正常 restart 后应该是常态，
+          我输入信息才变成工作态吧」。
+
+        **为什么会工作态**：`--reply` 为了"让主人看见 100% 挂着"会把 `state.json`
+        写成 `working`，而重启后新进程**照样认这份文件**；再叠加"我上一轮刚干完活、
+        会话记录还在 `EXIT_S` 余温内"，感知也判活跃 ⇒ **一起机就半睁**。
+
+        判据（**两条同时成立**才算冷启动）：
+          ① 启动后**还没见过 user 消息进入**（`act.user_at == 0`）—— 主人还没说话；
+          ② 启动后**没人写过新的 `state.json`**（mtime 仍是启动前那份）—— 我也没开工。
+        ⇒ 任何一条被打破（主人发消息 / 我写 `--work`）就立刻恢复正常判定，
+          不会把桌宠锁死在常态。
+        """
+        if self.act.user_at > 0:
+            return False
+        try:
+            if os.path.getmtime(STATE_FILE) > self._boot_at:
+                return False
+        except Exception:
+            pass
+        return True
+
     def _target_state(self, now=None):
         """当前该显示哪个状态。
 
@@ -933,14 +992,30 @@ class FairyPet:
         """
         if not self.follow and self.manual:
             return self.manual
-        # ★★ 2026-09-23 主人定：「输出完成后过 10 秒左右自动切回正常态」。
-        #   这一条**压过感知** —— 交付已经完成，不该因为"我还在写文件"被拖住。
-        #   `_settled` 由 tick 按 `progress.json` 的 `settle` 计时置位；下一轮开工自动复位。
-        if self._settled:
-            return "idle"
+        # ★★★ 2026-09-23 **修一个真 bug**（主人截图：「没有进入半睁眼状态啊」）：
+        #   原来 `_settled` 一为真就**提前 return**，于是下面那句 `self.act.active()`
+        #   再也不会被调用 —— **感知整个停摆**。证据：心跳里的 `age` 会一直涨
+        #   （16:22:29 实测 166.6 s，而会话文件 1 秒前刚写过）——
+        #   因为那次扫描压根没发生。
+        #   后果：收尾让位之后，主人再发消息、我再干活，桌宠都不会半睁，
+        #   必须等我写一次 `state.json` 才恢复。
+        #   ⇒ 现在**先无条件让感知更新一次**，再决定：
+        #       · 感知活跃（我在干活 / 主人刚提交）⇒ **working**（收尾态也压不住）
+        #       · 感知不活跃 + `_settled`         ⇒ idle（保留"让位"语义）
+        #       · 其余                            ⇒ 看 `auto_state`
+        #   ★ 这一句还兼着"刷新 `user_at` / `age` / `_hold_until`"的职责 ——
+        #     它们**只在 `active()` 里更新**，不调用就等于时钟停走。
+        _act_now = False
         if self.follow and self.auto_mode == "follow" and self.sense:
-            if self.act.active():
-                return "working"
+            _act_now = self.act.active()
+        # ★★ 冷启动（主人 2026-09-23：「正常 restart 后应该是常态，我输入信息才变成工作态吧」）：
+        #   上一轮遗留的 `state.json = working` 与会话余温**都不作数**。
+        #   ★ 注意 `active()` 仍然照调（上面那句）—— 它兼着"刷新时钟"的职责（见 REFERENCE V.10）。
+        _cold = self._cold_boot()
+        if _act_now and not _cold:
+            return "working"
+        if self._settled or _cold:
+            return "idle"
         return self.auto_state
 
     def _set_state(self, st, now):
@@ -1802,43 +1877,54 @@ class FairyPet:
                 self._settled = False
                 self._done_seen_at = None
             elif self.prog_settle:
-                if self._done_seen_at is None:
+                # ★★ 用 `_settle_mtime` 认"**新的一条** settle 记录"，不再用
+                #   `_done_seen_at is None` —— 后者在"主人开口 ⇒ 清空"之后会立刻重新成立，
+                #   收尾态就会反复挂上。
+                if self._settle_mtime != self._prog_mtime:
+                    self._settle_mtime = self._prog_mtime
                     self._done_seen_at = now
-                    out(u"[bar] 交付完成 ⇒ 100%% 挂着，等主人下一句指令（最多 %.0f s）"
+                    out(u"[bar] 交付完成 ⇒ 100%% 挂着，等主人开口 / 打字 / 兜底 %.0f s"
                         % DONE_SETTLE_S)
-                elif not self._settled:
+                # ★★ `_done_seen_at is not None` 这个保护**必须有**：
+                #   "主人开口"那条会把 `_done_seen_at` 清成 None，
+                #   而下一轮若又进到比较 `act.user_at > self._done_seen_at` ⇒ **None 参与
+                #   比较会抛 TypeError**（Python 3 不允许）。这个坑是我自己改出来的，
+                #   靠 `_work/v2_11_settle_sim.py` 的时序仿真抓到。
+                elif self._done_seen_at is not None and not self._settled:
                     # ★ 必须**显式**调一次 `active()`：`_settled` 为真时 `_target_state()`
                     #   会提前返回、根本走不到 `active()` ⇒ `user_at` 永远不刷新。
                     self.act.active()
-                    _why = u""
                     if self.act.user_at > self._done_seen_at:
-                        _why = u"主人已发新指令 ⇒ 收尾态让位"
-                    elif self._typing_in_wb():
-                        # ★★ 2026-09-23 主人：「不用等 60 秒或者我下一轮输入 …… 你能监控到
-                        #   输入窗口我在打字，就退出工作态」。**只在 100% 跑完之后**才允许
-                        #   —— 能走到这一支就一定是 `prog_done and prog_settle`，
-                        #     所以"任务中途插嘴"天然不可能误退（那时进不到这里）。
-                        _why = u"主人在 WorkBuddy 开始打字 ⇒ 收尾态让位"
-                    elif (now - self._done_seen_at) >= DONE_SETTLE_S:
-                        _why = u"收尾已挂满 %.0f s ⇒ 回常态" % DONE_SETTLE_S
-                    if _why:
-                        self._settled = True
-                        out(u"[bar] " + _why)
-                        # ★★ 顺便把 `state.json` 也改成 idle —— **别让文件撒谎**：
-                        #   原来只有内部切常态，文件一直写着 working，害我在真机自检里
-                        #   误判过一轮（`_work/step137`）。只写这一次，不是每帧。
-                        #   ★ 必须留在"真的收尾"这一支里：写早了 `state.json` 就说 idle，
-                        #     而 `_target_state()` 拿它当 `auto_state` ⇒ 100% 会提前消失。
-                        try:
-                            _tmp = STATE_FILE + ".tmp"
-                            with open(_tmp, "w", encoding="utf-8") as _f:
-                                json.dump({"state": "idle",
-                                           "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                                           "ttl": 2700, "note": u"交付完成，自动回常态"},
-                                          _f, ensure_ascii=False)
-                            os.replace(_tmp, STATE_FILE)
-                        except Exception as _e:
-                            log_err("settle_write_state", _e)
+                        # ★★★ 2026-09-23 主人当场纠正：「我输入完，你没有立即进入工作态
+                        #   （**不含进度条**的那种）」。根因：原来这里只置 `_settled`（回常态），
+                        #   而它的**复位**只发生在"progress.json 不带 done"时 ——
+                        #   我还没上报新进度，于是桌宠一直停在常态。
+                        #   ⇒ 现在：**他开口 = 新一轮开始 ⇒ 立刻结束收尾、交回感知**。
+                        #     下一帧感知就把它拉成工作态；`_bar_epoch` 已推到这条 settle
+                        #     ⇒ **没有进度条**（正是"第一项修改之前的思考期"该有的样子）。
+                        #     `state.json` **不写 idle**：马上就是新一轮工作，写了就是撒谎。
+                        self._settled = False
+                        self._done_seen_at = None
+                        self._bar_epoch = self._prog_mtime
+                        self._bar_shown = False
+                        self._bar_rev_t0 = None
+                        self._left_working_at = None
+                        out(u"[bar] 主人已开口 ⇒ 收尾结束，交回感知"
+                            u"（新一轮：有工作态、先无进度条）")
+                    else:
+                        _why = u""
+                        if self._typing_in_wb():
+                            # ★★ 2026-09-23 主人：「不用等 60 秒或者我下一轮输入 …… 你能监控到
+                            #   输入窗口我在打字，就退出工作态」。**只在 100% 跑完之后**才允许
+                            #   —— 能走到这一支就一定是 `prog_done and prog_settle`，
+                            #     所以"任务中途插嘴"天然不可能误退（那时进不到这里）。
+                            _why = u"主人在 WorkBuddy 开始打字 ⇒ 收尾态让位"
+                        elif (now - self._done_seen_at) >= DONE_SETTLE_S:
+                            _why = u"收尾已挂满 %.0f s ⇒ 回常态" % DONE_SETTLE_S
+                        if _why:
+                            self._settled = True
+                            out(u"[bar] " + _why)
+                            self._settle_idle_state()
 
         # --- 自动状态的来源：跟随 state.json，或本地「60 秒循环」（演示）---
         if self.auto_mode == "loop60":
