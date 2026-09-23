@@ -83,6 +83,84 @@ STATE = os.path.join(BASE, "state.json")
 #   跑一次回归就把主人正在看的进度从 95% 打回 68%（当天真发生）。
 #   ⇒ 验收统一 `FAIRY_PROGRESS=<临时文件>`。测试不该动生产状态。
 PROGRESS = os.environ.get("FAIRY_PROGRESS") or os.path.join(BASE, "progress.json")
+# ★★ 2026-09-23 17:3x：进度**按项目各存一份**（`_prog\progress_<项目>.json`）。
+#   起因（实测）：两个项目**同时**在跑时，上面那份全局 `progress.json`
+#   **后写的覆盖先写的** —— 本会话报 `--item 1 2` 时被工具直接拒掉，理由是
+#   "该报第 2 项"，因为另一个会话已经把 `item/phase` 写成了 `(2,1)`。
+#   ⇒ 各写各的；桌宠按**当前活跃项目**去取（见 `fairy_pet._read_progress`）。
+#   ★ 全局那份**照旧写**（老脚本 / 外部工具 / 推不出项目时都还要用它）。
+PROGRESS_DIR = os.path.join(BASE, "_prog")
+# ★ 演练 / 回归脚本用 `FAIRY_PROGRESS=<临时文件>` 做隔离 ⇒ 那种情况下**不碰**专属文件
+#   （`_prog\` 里那份是真的，一次回归就会把主人正在看的进度写花 —— 09-23 真发生过）。
+_ISOLATED = bool(os.environ.get("FAIRY_PROGRESS"))
+
+
+def prog_file(project):
+    u"""某项目的**专属**进度文件；`project` 为空 ⇒ 全局那份（老路径，保持兼容）。"""
+    if not project:
+        return PROGRESS
+    try:
+        import fairy_activity as _A
+        frag = _A.project_file_name(project)
+    except Exception:
+        frag = project
+    return os.path.join(PROGRESS_DIR, "progress_%s.json" % frag)
+
+
+_PJ_CACHE = [0.0, u""]
+
+
+def _env_project():
+    u"""从**本次调用者的环境**里读出它属于哪个项目 —— 最精确的判据。
+
+    ★ 实测（2026-09-23 17:4x）：WorkBuddy 给每个会话都注入了
+        `CODEBUDDY_PROJECT_DIR = /e/AI成图实践/Fairy`
+        `CODEBUDDY_SESSION_ID  = 212254f1-…`
+      ⇒ 用它反推项目目录名是**零成本、零歧义**的（`/e/A` ⇒ `e-A`，与 `project_key()` 同规则）。
+
+    ★★ 为什么**必须**用它，不能只靠"扫盘看谁的会话最新"：
+      两个会话**交替**写 jsonl 时，"谁最新"每次都在变 ⇒ 推断结果来回摇摆。
+      后果我实测到了：本会话的 `--item` 读到了**另一个项目**的进度（报格被拒），
+      而且自己的进度被写进了**另一个项目的专属文件**里 —— 两边彻底串味。
+    """
+    for k in ("CODEBUDDY_PROJECT_DIR", "CLAUDE_PROJECT_DIR"):
+        v = (os.environ.get(k) or u"").strip().replace(u"\\", u"/").strip(u"/")
+        parts = [p for p in v.split(u"/") if p]
+        if not parts:
+            continue
+        if len(parts[0]) == 2 and parts[0][1] == u":":
+            parts[0] = parts[0][0].lower()          # `C:` → `c`（与 `project_key()` 同规则）
+        return u"-".join(parts)
+    return u""
+
+
+def current_project(ttl=2.0):
+    u"""→ 我**此刻**在哪个 WorkBuddy 项目里干活（目录名，如 `e-AI成图实践-Fairy`）。
+
+    ★ 为什么要它：`progress.json` 是全局单文件 ⇒ 甲项目交付的 100% 会在乙项目开工时
+      顶出来（主人 2026-09-23 17:3x 原话：「换个项目就出现这个问题了，刚进入工作态
+      的时候，就是带工作条的」）⇒ 每条进度都打上**归属项目**。
+    ★ 判据**两级**：① 环境变量（`_env_project()`，精确、零成本）；
+      ② 认不出才回落到"扫盘看哪个项目的会话文件最新"（旧法，只在手动跑脚本时走到）。
+    ★ 都认不出 ⇒ 返回空串 = 不打标签，桌宠按旧行为处理（**不拦**）。
+      宁可少拦，不可误拦。
+    """
+    now = time.time()
+    if now - _PJ_CACHE[0] < ttl:
+        return _PJ_CACHE[1]
+    v = _env_project()
+    if not v:
+        try:
+            import fairy_activity as _A
+            w = _A.ActivityWatch()
+            if w.ok:
+                w.active()
+                v = w.last_dir or u""
+        except Exception:
+            v = u""
+    _PJ_CACHE[0], _PJ_CACHE[1] = now, v
+    return v
+
 
 # kind → (前缀, 是否进入工作态)
 KINDS = {
@@ -101,6 +179,19 @@ MEMO_TOP = 95.0                    # 90~95：我写记忆 / 落盘
 PHASE_CUM = (0.30, 0.80, 1.00)     # 每项内累计：计划思考 30% ⇒ +搜索修改 50% ⇒ +落位成果 20%
 PHASE_NAMES = (u"计划思考", u"搜索修改", u"落位成果")
 SETTLE_S = 180.0                   # 交付后**最多**挂多久等主人开口（写进 progress.json 给它看）
+WORK_TTL_S = 120.0                 # ★★ 2026-09-23 17:1x 主人：「你回复完都过了这么久，还在半睁眼状态？」
+                                   #   根因：**无进度条的任务（纯问答）只发 `--work`** —— 它把
+                                   #     `state.json` 写成 working 且 `ttl=2700`（45 min），而收尾
+                                   #     原来**只挂在 `--reply` 的 done/settle 上** ⇒ 感知一安静，
+                                   #     `_target_state()` 就落到最后一行 `return self.auto_state`
+                                   #     ⇒ **顶着 working 不放**（实测 17:01 写的，17:08 还半睁）。
+                                   #   ⇒ 「开工」那一下（**还没带进度**）改用**短 ttl**：
+                                   #     · 纯问答：我回复完 ⇒ 感知 25 s 尾巴走完 ⇒ ttl 也到期
+                                   #       ⇒ 自己回常态（不用等 45 min）。
+                                   #     · 正经任务**不受影响**：`--plan` 让条登场后，感知活跃时
+                                   #       **优先级高于 `auto_state`**（见 `fairy_pet._target_state`），
+                                   #       所以长任务不会被这段短 ttl 打断。
+                                   #   ★ 只换**默认值**；显式 `--ttl N` 照旧听主人的。
 #   ★★ 桌宠的主判据已经改成"**主人发下一句指令就让位**"，这个数只是兜底上限
 #      ⇒ 必须与 `fairy_pet.DONE_SETTLE_S` 一致（不一致就是文件在撒谎）。
 #   ★★ 2026-09-23：**必须与 `fairy_pet.DONE_SETTLE_S` 保持一致**。
@@ -219,18 +310,49 @@ def set_progress(pct, note="", done=False, planned=True, **extra):
     v = max(0.0, min(100.0, float(pct)))
     d = {"percent": v, "ts": time.time(), "note": note,
          "done": bool(done), "planned": bool(planned)}
+    # ★★ 2026-09-23 17:3x：打上**归属项目** —— 桌宠据此判断"这条该不该在现在这个
+    #   项目里显示"（见 `current_project()` 的说明）。
+    _pj = current_project()
+    if _pj:
+        d["project"] = _pj
     d.update(extra)
     atomic_write(PROGRESS, d)
+    # ★★ 专属文件：两个项目同时跑时，全局那份会被**后写的覆盖**
+    #   （实测被它坑过：`--item` 直接被跳步防护拒掉）。
+    #   ⇒ 再写一份"属于本项目的"。写失败**绝不影响主流程**（它只是更准的那一份）。
+    if _pj and not _ISOLATED:
+        try:
+            if not os.path.isdir(PROGRESS_DIR):
+                os.makedirs(PROGRESS_DIR)
+            atomic_write(prog_file(_pj), d)
+        except Exception:
+            pass
     return v
 
 
-def read_progress():
-    u"""读回 progress.json（没有 / 坏了 ⇒ 空 dict）。"""
-    try:
-        with open(PROGRESS, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+def read_progress(project=None):
+    u"""读回进度（没有 / 坏了 ⇒ 空 dict）。
+
+    `project` 非空 ⇒ 先读它**专属**那份；读不到再回落全局那份 ——
+    但回落时**要认归属**：全局那份若写着"属于别的项目"，就当它不存在。
+    ★ 实测被这个坑过（2026-09-23 17:4x）：回落读到另一个项目的 `stages/item/phase`
+      ⇒ 拿别人的格数算我的百分比，报格被工具拒掉（"3 项已全部报完"）。
+    """
+    mine = prog_file(project) if project else None
+    for p in (mine, PROGRESS):
+        if not p:
+            continue
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            continue
+        if project and p != mine:
+            _own = d.get("project")
+            if _own and _own != project:
+                continue              # ★ 别人的进度 ⇒ 当它不存在
+        return d
+    return {}
 
 
 def do_plan(stages, note=""):
@@ -248,7 +370,8 @@ def do_plan(stages, note=""):
 
 def do_item(k, p, note=""):
     u"""② 第 K 项的**第 P 阶段**完成 ⇒ 自动算百分比（`pct_item`）。返回 (K, N, P, 百分比)。"""
-    d = read_progress()
+    # ★ 读**本项目**的那一份 —— 全局那份可能已被另一个项目覆盖（见 `PROGRESS_DIR`）。
+    d = read_progress(current_project())
     n = int(d.get("stages") or 0)
     if n <= 0:
         raise SystemExit(u"⚠️ 还没 `--plan N`，不知道要等分成几项（progress.json=%r）" % d)
@@ -290,7 +413,7 @@ def do_item(k, p, note=""):
 
 def do_memo(p=5.0, note=""):
     u"""③ 写记忆 / 落盘（90~95%）⇒ 默认写到 95%。返回百分比。"""
-    d = read_progress()
+    d = read_progress(current_project())     # ★ 读本项目的（见 `PROGRESS_DIR`）
     n = int(d.get("stages") or 0)
     p = max(0.0, min(MEMO_TOP - WORK_TOP, float(p)))
     v = roundup(WORK_TOP + p, 1)      # 保留 1 位小数，仍向上
@@ -320,7 +443,7 @@ def do_reply(p=5.0, text="", note="", secs=12.0, ttl=2700.0):
       `p<5` 时只是把条往前推一点，不弹卡、不动状态。
     返回 (百分比, 是否收尾, 卡面文案)。
     """
-    d = read_progress()
+    d = read_progress(current_project())      # ★ 读本项目的（见 `PROGRESS_DIR`）
     n = int(d.get("stages") or 0)
     p = max(0.0, min(5.0, float(p)))
     v = roundup(MEMO_TOP + p, 1)      # 保留 1 位小数，仍向上
@@ -470,8 +593,14 @@ def main():
         else:
             st = KINDS.get(kind, ("", "idle"))[1] if kind else None
         if st:
+            # ★★ 「开工」那一下（working 且**还没带进度**）用短 ttl —— 见 `WORK_TTL_S` 的说明。
+            #   纯问答只发 `--work`（没有 `--reply` 的 done/settle），短 ttl 就是它**唯一**的
+            #   收尾路径。带进度的档要么提前 return（`--reply`），要么不改这里的默认值。
+            _ttl = a.ttl
+            if st == "working" and a.progress is None and abs(a.ttl - 2700.0) < 1e-6:
+                _ttl = WORK_TTL_S
             atomic_write(STATE, {"state": st, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                                 "ttl": a.ttl, "note": text[:40]})
+                                 "ttl": _ttl, "note": text[:40]})
             # ★ 进度与状态一起走：开工归 0、收工置满（否则会出现"WorkBuddy 说忙、
             #   进度条却停在上一次的 87%"这种自相矛盾的画面）
             if a.progress is not None:

@@ -64,6 +64,27 @@ STOP_FILE = os.path.join(BASE, "stop.txt")
 POKE_FILE = os.path.join(BASE, "poke.txt")      # ★ 再次双击启动时，用它叫醒已在运行的实例
 NOTIFY_FILE = os.path.join(BASE, "notify.json")  # ★ 任务完成通知：我干完活写它，桌宠弹通知卡
 PROGRESS_FILE = os.path.join(BASE, "progress.json")   # ★ 工作进度：我上报 0~100，工作态显示进度条
+# ★★ 2026-09-23 17:3x：**按项目分存的进度**（`fairy_notify` 同时写的那份"更准的"）。
+#   起因：全局那份**两个项目会互相覆盖**，而且甲项目交付的 100% 会在乙项目开工时顶出来
+#   （主人原话："换个项目就出现这个问题了"）。详见 `_read_progress()`。
+PROG_DIR = os.path.join(BASE, "_prog")
+
+
+def proj_file(project):
+    u"""项目目录名 → 专属进度文件路径。
+
+    ★ 规则本体在 `fairy_activity.project_file_name()`（**单点定义**）——
+      `fairy_notify.prog_file()` 与我这里是同一套；两处不一致就会"读错项目的条"。
+    ★ `project` 为空 ⇒ 全局那份（老路径，行为不变）。
+    """
+    if not project:
+        return PROGRESS_FILE
+    try:
+        import fairy_activity as _A
+        frag = _A.project_file_name(project)
+    except Exception:
+        frag = project
+    return os.path.join(PROG_DIR, "progress_%s.json" % frag)
 CACHE_DIR = os.path.join(BASE, "_cache")
 
 # ---------------------------------------------------------------- 可调参数
@@ -491,6 +512,9 @@ class FairyPet:
         #      ⇒ ① 这个 100% **要显示**（不像 `--done` 的收工残留那样按 0 处理）；
         #         ② `DONE_SETTLE_S` 秒后**自己回常态**（主人："过 10 秒后切换到正常态"）。
         self.prog_settle = False        # progress.json 里的 settle 标记
+        #   ★★ 2026-09-23 17:3x：这条进度**属于哪个项目**（`fairy_notify` 打的标签）。
+        #      空 = 没标签 ⇒ `_proj_ok()` 一律放行。见 `_proj_ok()` / `_read_progress()`。
+        self.prog_project = u""
         self._done_seen_at = None       # 首次看到"已交付"的时刻（计时用）
         # ★★ 2026-09-23：记下"**已经计过时**的那条 settle 记录的 mtime"。
         #   为什么需要它：原来用 `_done_seen_at is None` 当"首次"判据，
@@ -516,12 +540,14 @@ class FairyPet:
         self._pct_tgt = 0.0         # ★ 目标值（= 我上报的那个数）
         self._bar_want = False      # 此刻该不该画进度条（见 _bar_wanted）
         self._left_working_at = None   # 离开工作态的时刻（短暂离开不算换轮，见 tick）
-        #   ★ 启动那一刻的 progress.json 版本：只有**启动之后新写下的**进度才算数
+        #   ★ 启动那一刻的"进度版本"：只有**启动之后新写下的**进度才算数
         #     （否则上一轮被打断留下的旧值会在新任务开头冒出来 + 白播一次出现动画）
-        try:
-            self._bar_epoch = os.path.getmtime(PROGRESS_FILE)
-        except Exception:
-            self._bar_epoch = 0.0
+        #   ★★ 2026-09-23 17:3x 改成**启动时刻本身**，不再取 `progress.json` 的 mtime：
+        #     进度现在可能来自**专属文件**（`_prog\progress_<项目>.json`，见 `_read_progress`）
+        #     ⇒ 拿"全局那份的 mtime"去比"专属那份的 mtime"，是**两个文件在比**，
+        #       谁新谁旧只看写入次序 ⇒ 判据会随机成立/失效。
+        #     "启动时刻"是同一时钟上的同一个点、与文件是哪一个无关 ⇒ 稳。
+        self._bar_epoch = time.time()
         # ★ 开机动画结束后"登场"用：位移计划 + 淡入
         #   `_move` = (t0, 起点x, 起点y, 终点x, 终点y, 时长, 延迟)
         self._move = None
@@ -787,8 +813,39 @@ class FairyPet:
             log_err("read_state", e)
             return "idle", ""
 
+    def _act_dir(self):
+        u"""当前**活跃项目的目录名**（感知报的）；感知关掉 / 还没扫到 ⇒ 空串。"""
+        return getattr(self.act, "last_dir", "") or ""
+
+    def _proj_ok(self):
+        u"""这条进度**是不是当前活跃项目写的**。
+
+        ★★ 2026-09-23 17:3x：`progress.json` 是全局单文件 ⇒ 甲项目交付的 100%
+          会在乙项目开工时顶出来（主人原话：「换个项目就出现这个问题了，
+          刚进入工作态的时候，就是带工作条的」）。⇒ 我上报时打上归属项目，这里校验。
+        ★ **任一侧为空就放行**（老文件没写 `project`、或推不出活跃项目）——
+          "宁可少拦，不可误拦"：拦错的后果是"该出现的条不出现"，那更糟。
+        ★ 匹配用**双向前缀**（与 `fairy_activity._match` 同口径）—— 容目录名被截断、
+          容发布副本改名（`fairy-desktop-pet` vs `e-AI成图实践-Fairy`）。
+        """
+        pj = self.prog_project
+        cur = self._act_dir()
+        if not pj or not cur:
+            return True
+        a, b = pj.lower(), cur.lower()
+        return a == b or a.startswith(b) or b.startswith(a)
+
     def _read_progress(self):
-        u"""读 `progress.json` → `(0..100 的 float 或 None, done, planned, mtime, settle)`。
+        u"""读进度 → `(0..100 的 float 或 None, done, planned, mtime, settle, project)`。
+
+        ★★ 2026-09-23 17:3x：**优先读「当前活跃项目」的专属文件**
+          （`_prog\\progress_<项目>.json`，由 `fairy_notify` 同时写的那份）。
+          原因（实测）：`progress.json` 是全局单文件 ⇒
+            ① 两个项目**同时**跑时**后写的覆盖先写的**（本会话报 `--item 1 2` 被跳步防护
+               拒掉，就是另一个会话把 `item/phase` 写成了 `(2,1)`）；
+            ② 甲项目交付的 100% 会在乙项目开工时顶出来 —— 就是主人截图那条
+               「换个项目就出现这个问题了，刚进入工作态的时候，就是带工作条的」。
+          ⇒ 专属文件取不到（老文件 / 推不出项目 / 还没扫到）就回落到全局那份，行为不变。
 
     `settle=True` = `--reply` 交付收尾写下的那条 ⇒ 见 `DONE_SETTLE_S`。
 
@@ -802,20 +859,30 @@ class FairyPet:
         `mtime` = 文件最后修改时间。★ 用它比"这一轮工作开始时"的版本 ——
                   只有**新写下的**进度才算数，否则上一轮被打断留下的旧值会在新任务开头冒出来。
         """
+        _path = PROGRESS_FILE
         try:
-            with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
+            _pj = self._act_dir()
+            if _pj:
+                _alt = proj_file(_pj)
+                if os.path.exists(_alt):
+                    _path = _alt
+        except Exception:
+            _path = PROGRESS_FILE
+        try:
+            with open(_path, "r", encoding="utf-8") as f:
                 d = json.load(f)
-            mt = os.path.getmtime(PROGRESS_FILE)
+            mt = os.path.getmtime(_path)
             v = d.get("percent", d.get("value", d.get("progress")))
             if v is None:
-                return None, False, True, mt, False
+                return None, False, True, mt, False, u""
             return (float(max(0.0, min(100.0, float(v)))), bool(d.get("done")),
-                    bool(d.get("planned", True)), mt, bool(d.get("settle")))
+                    bool(d.get("planned", True)), mt, bool(d.get("settle")),
+                    str(d.get("project") or u""))
         except FileNotFoundError:
-            return None, False, True, 0.0, False
+            return None, False, True, 0.0, False, u""
         except Exception as e:
             log_err("read_progress", e)
-            return None, False, True, 0.0, False
+            return None, False, True, 0.0, False, u""
 
     def _bar_wanted(self):
         u"""此刻**该不该**画出进度条。
@@ -834,6 +901,12 @@ class FairyPet:
         # ★★ 2026-09-23：`--reply` 到 100% 写的是 `done=True, settle=True`，那个 100%
         #   **是要显示出来的**（主人要"看它跑到 100%、卡片弹出、再回常态"）。
         #   原来 `prog_done ⇒ 不画` 只该管 `--done` 的收工残留。
+        # ★★ 2026-09-23 17:3x：**归属项目不对 ⇒ 一律不显示**。
+        #   主人截图那条「换个项目就出现这个问题了，刚进入工作态的时候，就是带工作条的」
+        #   就是这么来的 —— 全局 `progress.json` 里留着**上一个项目**交付的 100%。
+        #   判据见 `_proj_ok()`（任一侧为空则放行，不误拦）。
+        if not self._proj_ok():
+            return False
         if self.prog is None or not self.prog_planned:
             return False
         if self.prog_done and not self.prog_settle:
@@ -1866,7 +1939,8 @@ class FairyPet:
         if now - self.prog_poll_at > 0.5:
             self.prog_poll_at = now
             (self.prog, self.prog_done, self.prog_planned,
-             self._prog_mtime, self.prog_settle) = self._read_progress()
+             self._prog_mtime, self.prog_settle,
+             self.prog_project) = self._read_progress()
             # ★★ 2026-09-23：交付（`--reply` 到 100%）后，**等主人开口**才让位。
             #   「我做完」≠「他看见」—— `--reply` 是我做的最后一件事，回复正文还要生成/渲染，
             #   界面才显示；按秒数计时**必然**在他读到之前到期（10 s、60 s 都试过，都不够）。
@@ -2407,7 +2481,17 @@ class FairyPet:
         if st == "working":
             try:
                 _age = time.time() - os.path.getmtime(PROGRESS_FILE)
-                if self.prog is not None and _age < AUTO_TIMEOUT_S:
+                # ★★★ 2026-09-23 17:3x 主人截图抓到（原话：「**换个项目就出现这个问题了**，
+                #   刚进入工作态的时候，就是带工作条的」）：
+                #   上面这个放宽**把上一轮 `--reply` 的 100%+settle 也一并接受了**
+                #   ⇒ 一起机（或切个项目）就顶出一条满条。
+                #   它的本意只是「我开工时写的进度，别因为他双击晚了就被判成上一轮的」
+                #   —— 那类记录**一定是 `done=False`**（我正在干）。
+                #   ⇒ 加 `not self.prog_done`：收尾记录（`--done` / `--reply` 的 100%）
+                #     一律**不接受**（它们该由收尾让位那条路管，见 tick 里的 settle 段）。
+                #   ★ 再加 `self._proj_ok()`：**别的项目**残留的进度，一起机也不该被接受。
+                if (self.prog is not None and not self.prog_done
+                        and self._proj_ok() and _age < AUTO_TIMEOUT_S):
                     self._bar_epoch = 0.0
                     out(u"[bar] 启动即在工作中 ⇒ 接受已有 progress.json"
                         u"（%.0f%%，写在 %.0f s 前）" % (self.prog, _age))

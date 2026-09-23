@@ -64,6 +64,21 @@ def project_key(path):
             + rest.strip(u"\\/").replace(u"\\", u"-").replace(u"/", u"-"))
 
 
+def project_file_name(project):
+    u"""项目目录名 → **文件名片段**（只留字母/数字/中文与 `-_`，其余换 `_`）。
+
+    ★ 单点定义：`fairy_notify` 写进度、`fairy_pet` 读进度，**两边都必须用这一条规则**
+      （两处各写一遍迟早会不一致 ⇒ 表现为"条永远不出现"或"读错项目的条"）。
+    ★ 为什么需要它（2026-09-23 17:3x 实测）：两个项目**同时**在跑时，
+      `progress.json` 是全局单文件、**后写的覆盖先写的** —— 本会话报 `--item 1 2` 时
+      被工具拒掉，因为另一个会话已经把 `item/phase` 写成了 `(2,1)`。
+      ⇒ 进度**按项目各存一份**，桌宠只读"当前活跃项目"那一份。
+    """
+    if not project:
+        return u""
+    return u"".join(c if (c.isalnum() or c in u"-_") else u"_" for c in project)
+
+
 def config_only(path=ONLY_FILE, repo_root=None):
     u"""→ 要监控的项目目录名列表（**空列表 = 不限制**）。
 
@@ -127,9 +142,21 @@ class ActivityWatch:
         # ★★ 只盯这些项目（空 = 全部）。见文件顶部 `config_only()` 的说明 ——
         #   同时开多个任务时，不限定就会"谁在动就跟谁"，必然混淆。
         self.only = list(only) if only is not None else config_only()
+        # ★★ 2026-09-23 17:4x：记下"白名单是不是**调用方显式传进来的**"。
+        #   热读（`_refresh_dirs` 每 10 s 重读配置文件）**只该在"没显式传"时生效** ——
+        #   原来它无条件覆盖 `self.only` ⇒ 显式传参被**静默无视**
+        #   （`v2_12` 那条"换成只盯 20260920"的反证因此失败：实际跑的仍是配置里那两行）。
+        #   这正是"改了 A 却跑的是 B"那一类 —— 只有真去反证才会暴露。
+        self._only_explicit = only is not None
         self.skipped = 0             # 诊断：这一轮被"项目过滤"挡掉了几个目录
         self.last_act = 0.0          # 最近一次活动的墙钟时间
         self.last_file = ""          # 诊断：哪个会话文件在动
+        # ★ 2026-09-23 17:3x：**当前活跃项目的目录名**（如 `e-AI成图实践-Fairy`）。
+        #   用途：`progress.json` 是全局单文件 ⇒ 甲项目交付的 100% 会在乙项目开工时
+        #   顶出来（主人原话："换个项目就出现这个问题了，刚进入工作态的时候，就是带工作条的"）
+        #   ⇒ 我上报进度时打上**归属项目**，桌宠只认「属于当前活跃项目」的那条。
+        #   取用见 `fairy_notify.current_project()` 与 `fairy_pet._proj_ok()`。
+        self.last_dir = ""
         self.last_type = ""          # 诊断：末尾事件类型（已跳过 harness 记账类）
         self.last_role = ""          # 诊断：末尾事件 role
         # ★ 2026-09-23：尾部**最近一条 message** 的角色 —— 判"他还在等我"用（见 `active()`）
@@ -155,6 +182,19 @@ class ActivityWatch:
         if now - self._dirs_at < 10.0:
             return
         self._dirs_at = now
+        # ★★ 2026-09-23 17:2x：白名单**热生效** —— 跟子目录列表一起，每 10 s 重读一次。
+        #   原来 `self.only` 只在 `__init__` 里读一次 ⇒ 改一行配置要"退出桌宠 →
+        #   双击 restart_fairy.vbs"，摩擦太大（主人 17:2x 就为加一个项目多重启一次）。
+        #   ★ 只读一个小文本，开销可忽略。
+        #   ★★ 读失败或读到空 ⇒ **沿用旧值**，绝不把白名单清空 ——
+        #     清了就变回"谁在动跟谁"，正是我们要避免的混淆。
+        try:
+            if not self._only_explicit:      # ★ 显式传了白名单 ⇒ 不覆盖（见 __init__ 的说明）
+                _new = config_only()
+                if _new:
+                    self.only = _new
+        except Exception:
+            pass
         try:
             self._subdirs = [e.path for e in os.scandir(self.root) if e.is_dir()]
         except Exception:
@@ -201,6 +241,8 @@ class ActivityWatch:
         if best:
             self.last_act = max(self.last_act, best)
             self.last_file = os.path.basename(best_p)
+            # ★ 顺手记下"这个会话文件属于哪个项目"（见 `last_dir` 的说明）
+            self.last_dir = os.path.basename(os.path.dirname(best_p))
         return best_p, best
 
     @staticmethod
@@ -330,8 +372,12 @@ class ActivityWatch:
           排障第一件事就是确认"它有没有在看别的项目"。
         """
         a = self.age()
-        proj = ((u"%d个项目" % len(self.only)) if len(self.only) != 1
-                else self.only[0]) if self.only else u"全部"
+        # ★ 2026-09-23 17:3x：优先报**实际在动的那一个项目**（`last_dir`）。
+        #   白名单允许写多行，只报"第一个"看不出桌宠到底在跟谁 ⇒ 排障白费。
+        proj = self.last_dir
+        if not proj:
+            proj = ((u"%d个项目" % len(self.only)) if len(self.only) != 1
+                    else self.only[0]) if self.only else u"全部"
         return "%s|%s|%.1fs|%s,挡%d" % (self.last_type or "-", self.hint,
                                         a if a < 1e6 else -1, proj, self.skipped)
 
