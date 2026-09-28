@@ -40,3 +40,11 @@ hook_sessions.json
 activity_project.txt
 *.bak_fairy_*
 *.bak_junk_*
+
+# ---------- 备份 / 临时文件（我自己的脚本会生成，绝不该入库）----------
+*.bak
+*.bak_*
+*.orig
+*.tmp
+*_report.txt
+*_summary.txt
