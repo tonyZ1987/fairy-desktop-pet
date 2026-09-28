@@ -55,6 +55,18 @@ except Exception as _e:              #   ★ 兜底：动画模块出问题**绝
     BOOT = None
     print("[fairy] 开机动画模块不可用：%r" % (_e,))
 
+try:
+    import fairy_chat as CHAT        # ★ STEP18 聊天窗（**第二个窗口** + 真 EDIT 控件）
+except Exception as _e:              #   ★ 同样兜底：聊天模块坏了绝不能让桌宠起不来
+    CHAT = None
+    print("[fairy] 聊天窗模块不可用：%r" % (_e,))
+
+try:
+    import fairy_greet as GREET      # ★ STEP20 重启问候卡（时间前缀 + 官方语料套句）
+except Exception as _e:              #   ★ 同样兜底：问候模块坏了只是没问候，别影响启动
+    GREET = None
+    print("[fairy] 问候模块不可用：%r" % (_e,))
+
 # ---------------------------------------------------------------- 路径
 STATE_FILE = os.path.join(BASE, "state.json")
 POS_FILE = os.path.join(BASE, "pos.json")
@@ -63,6 +75,11 @@ ERRLOG = os.path.join(BASE, "pet_error.log")
 STOP_FILE = os.path.join(BASE, "stop.txt")
 POKE_FILE = os.path.join(BASE, "poke.txt")      # ★ 再次双击启动时，用它叫醒已在运行的实例
 NOTIFY_FILE = os.path.join(BASE, "notify.json")  # ★ 任务完成通知：我干完活写它，桌宠弹通知卡
+
+# ★★ STEP20：重启问候卡的**宽限时限**（秒）。
+#   启动瞬间若正好有 `notify.json` 在弹卡，问候就顺延；超过这么久还没轮到就作罢
+#   —— 问候的价值只在"刚开机那一下"，拖到主人已经干起活来的时候再冒出来会很怪。
+GREET_GRACE_S = 90.0
 PROGRESS_FILE = os.path.join(BASE, "progress.json")   # ★ 工作进度：我上报 0~100，工作态显示进度条
 # ★★ 2026-09-23 17:3x：**按项目分存的进度**（`fairy_notify` 同时写的那份"更准的"）。
 #   起因：全局那份**两个项目会互相覆盖**，而且甲项目交付的 100% 会在乙项目开工时顶出来
@@ -147,7 +164,29 @@ BAR_REVEAL_S = 0.90         # ★ 主人 2026-09-23：改用 PPT 式淡入 ⇒ 0
 BAR_REHIDE_S = 2.0          # 离开工作态超过这么久才算"这一轮结束"（短暂空档不重播动画）
 #   ★★ 2026-09-23 主人定：「输出完成后应该过 10 秒左右自动切回正常态」。
 #     判据 = `progress.json` 里的 `settle`（只有 `--reply` 走到 100% 才写这个键）。
-DONE_SETTLE_S = 180.0       # 交付到 100% 后，**最多**挂这么久等主人开口（**兜底上限**）
+TASK_STALE_S = 300.0        # ★★ 2026-09-28 主人：「终止的任务要**立即**退工作态」
+                            #   ⇒ 30 分钟（1800）**太长**：一个停在 0% 的残留能占位半小时，
+                            #   把真正在干活的项目的条全挡住（09-28 10:2x 实拍）。
+                            #   缩到 **5 分钟**；靠"感知在动"兜底，不会误踢在干活的项目。
+                            #   判据见 `_open_tasks()`：
+                            #   **进度文件很久没更新 且 感知也没动静** ⇒ 才算失效。
+                            #   为什么需要它：那边的我**可能没发完结信号就消失了**
+                            #   （会话被关、任务被中断）⇒ 没有兜底就会**永远半睁**。
+
+# ★★ 2026-09-28 主人同意加「新鲜度」：条上的数字**多久没更新**算陈旧。
+#   超过它 ⇒ 数字写成 `≈65%` 并轻微降亮（见 `_prog_stale` / `fairy_bar.number_rgba`）。
+#   ★ 取 150 s（= `TASK_STALE_S` 的一半）的两个理由：
+#     · 下限：三段式里一格（计划/搜索/落位）常常一两分钟，报得不够勤就会**闪**⇒ 取大些；
+#     · 上限：必须**小于** `TASK_STALE_S` —— 否则标记还没来得及露面，`_open_tasks()`
+#       就已经把这个任务踢出队列了（那就永远看不到标记）。
+PROG_STALE_S = 150.0
+
+DONE_SETTLE_S = 60.0        # 交付到 100% 后，**最多**挂这么久等主人开口（**兜底上限**）
+                            #   ★ 2026-09-23 20:2x 主人定：180 → **60**。
+                            #     理由：这不是「给他看 100% 多久」，而是**兜底** ——
+                            #     正常路径是「他开口/打字 ⇒ 立刻让位」。60 s 足够他读完回复，
+                            #     又不至于他早就不看了它还挂着。
+                            #   ★ 必须与 `fairy_notify.SETTLE_S` 一致（不一致就是文件在撒谎）。
                             #   ★★ 2026-09-23：14:2x 主人抓到「从你输出到**我看到**你的完整回复，
                             #    这段时间已经从工作态变回正常态了」⇒ 改 60 s；14:5x 又抓到
                             #    **60 s 也不够**（「你的回复卡了很久，导致 60 秒的工作态退出了」）。
@@ -500,6 +539,12 @@ class FairyPet:
         self.notify_kind = "work"   # ★ 决定卡片配色（干活/问答/闲聊），来自 notify.json 的 kind
         self.notify_poll_at = 0.0
         self._note_up = False       # ★ 通知卡是否已判定「落在进度条上方」（粘性，见 _overlay）
+        # ★★ STEP20 重启问候卡：**开机后弹一次**（`run()` 里置 True，tick 里消费）。
+        #   走 `_greet_pending` 而不是启动时直接弹，是为了**复用** notify 那条守卫
+        #   （等状态与进度都读过 + 不在开机动画里）—— 否则会重现 2026-09-22 那次
+        #   「黑条压在进度条上」的事故。`_greet_deadline` = 别拖太久才冒出来。
+        self._greet_pending = False
+        self._greet_deadline = 0.0
         # ★ 工作态进度条（2026-09-22 主人拍板接进主程序）
         #   `progress.json` 由我上报 0~100；它**跟工作态一起出现/消失**（都挂在 open_t 的过渡上），
         #   所以不需要额外的显隐状态机。没有文件 ⇒ 按 0% 起（"进度条从工作开始就存在"）。
@@ -529,6 +574,12 @@ class FairyPet:
             self._settle_mtime = 0.0
         # ★★ 冷启动时刻（墙钟）：`_cold_boot()` 用它判断"启动后有没有人来搭理过我"。
         self._boot_at = time.time()
+        # ★ 2026-09-24 多项目排队：未交付任务列表的 1 秒缓存
+        #   （60 fps 下**不能每帧扫目录**）
+        self._tasks_cache = (0.0, [])
+        # ★ 2026-09-24：**本轮进度条绑定给哪个项目**（"第一个开始的"）——
+        #   它交付后就置空 ⇒ 条消失、不接棒给后面的项目（见 `_bar_project`）。
+        self._bar_owner = u""
         self._settled = False           # 已交付超 DONE_SETTLE_S ⇒ 强制常态，直到下一轮开工
         self.prog_poll_at = 0.0
         self._prog_mtime = 0.0      # progress.json 的最后写入时间（判"是不是这一轮新上报的"）
@@ -565,6 +616,12 @@ class FairyPet:
 
         self._alpha = np.zeros((self.win, self.win), dtype=np.uint8)
         self.hwnd = None
+        # ★★ STEP18 聊天窗：**懒创建**（主人第一次单击才建）。
+        #   `CHAT is None`（模块 import 失败）⇒ 永远不建，桌宠照常跑 —— 这是兜底第一层。
+        self.chat = None
+        self._pending_click = None      # 「单击桌宠」的待判定时刻（等 280 ms 看有没有双击）
+        self._down_at = 0.0             # 左键按下时刻（用来判"单击"还是"拖动"）
+        self._down_pos = None           # 左键按下的客户区坐标
         self._show_requested = False   # True 才做"窗口不见了就亮回来"的自愈（离线自检不打扰）
         self._dib = self._bits = self._hdc = None
         self._wndproc = None
@@ -817,8 +874,115 @@ class FairyPet:
         u"""当前**活跃项目的目录名**（感知报的）；感知关掉 / 还没扫到 ⇒ 空串。"""
         return getattr(self.act, "last_dir", "") or ""
 
+    # ================================================== ★ 多项目排队（2026-09-24）
+    def _prog_files(self):
+        u"""扫 `_prog/` 下**每个项目**的进度文件 → `{项目名: 数据}`。
+
+        ★ 为什么要"全扫"：以前只读**一个**项目那份（"当前活跃项目"），
+          一旦活跃项目判错（被记账事件抢走、或主人在别的窗口说话），
+          进度条就读到**别人的**值 ⇒ 表现为"工作态对、条却不对/没有"。
+        """
+        out = {}
+        try:
+            if not os.path.isdir(PROG_DIR):
+                return out
+            for n in os.listdir(PROG_DIR):
+                if not (n.startswith("progress_") and n.endswith(".json")):
+                    continue
+                pj = n[len("progress_"):-len(".json")]
+                try:
+                    with open(os.path.join(PROG_DIR, n), "r", encoding="utf-8") as f:
+                        d = json.load(f)
+                except Exception as e:
+                    # ★★ 2026-09-24 教训：这里原来是裸 `except Exception: continue` ——
+                    #   它把一个 `NameError`（我改名没改全）**吞了**，表现成"目录里有文件
+                    #   却一个都扫不到"，查了好几轮。**必须留证据**。
+                    log_err("prog_files:read", e)
+                    continue
+                if isinstance(d, dict):
+                    out[str(d.get("project") or pj)] = d
+        except Exception as e:
+            log_err("prog_files", e)
+        return out
+
+    def _open_tasks(self):
+        u"""→ **还没交付**的任务，按**开工时刻**升序：`[(项目名, 数据), …]`（1 秒缓存）。
+
+        ★★★ 2026-09-24 主人定的**多项目排队规则**：
+          · 「进度条只显示**第一个开始**的项目的任务，其余……列入**排队序列**」
+          · 「只要有一个任务在思考中或者进行中，**只要没发完结信号，工作态都不能退出**」
+
+        **判"未交付"**：`done` 为假，且**有开工时刻**（`started_at`；老文件退化为 `ts`）。
+
+        **判"还活着"**（防"没发完结信号就永远半睁"）：那条进度**很久没更新**
+        （> `TASK_STALE_S`）**且**感知那边也**没有**它的动静 ⇒ 视作失效。
+        ★ 两个条件都要满足才判死 —— 因为**那边的我未必上报**（实测 5 分钟只报 4 次），
+          但**感知一定看得到 jsonl 的活动**。
+        """
+        now = time.time()
+        # ★ 用 `getattr` 兜一下：这个字段是 2026-09-24 才加的，
+        #   万一某个老实例/测试漏设，也只是少一层缓存，**不能让它崩**。
+        _at, _hit = getattr(self, "_tasks_cache", (0.0, []))
+        if now - _at < 1.0:
+            return _hit                     # ★ 60 fps 下不能每帧扫目录
+        per = getattr(self.act, "per_proj", None) or {}
+        rows = []
+        for pj, d in self._prog_files().items():
+            try:
+                if d.get("done"):
+                    continue                 # 已交付 ⇒ 出队
+                if d.get("abort"):
+                    # ★★ 2026-09-28 主人：「一旦我终止的任务，那么**立即**退出工作态」
+                    #   ⇒ `--abort` 写下的作废标记**不等超时、立刻出队**。
+                    continue
+                started = float(d.get("started_at") or d.get("ts") or 0.0)
+                if not started:
+                    continue                 # 连 ts 都没有 ⇒ 无从判断，跳过
+                seen = max(float(d.get("ts") or 0.0), float(per.get(pj) or 0.0))
+                if now - seen > TASK_STALE_S:
+                    continue                 # 既没上报、感知也没动静 ⇒ 当它没了
+                rows.append((started, str(pj), d))
+            except Exception:
+                continue
+        rows.sort(key=lambda x: x[0])
+        out = [(pj, d) for _s, pj, d in rows]
+        self._tasks_cache = (now, out)
+        return out
+
+    def _has_open_tasks(self):
+        u"""还有**没交付**的任务吗 —— 主人那条「工作态都不能退出」的判据。"""
+        return bool(self._open_tasks())
+
+    def _bar_project(self):
+        u"""进度条该显示**哪个项目** = **本轮绑定的那一个**（不是"当前队头"）。
+
+        ★★★ 主人 2026-09-24 定的规则（原话）：
+          「**进度条只显示第一个开始**的项目的任务，其余项目开始发的信号列入**排队序列**」
+          「第一个项目完结……如果还有，就保持工作态，**此时进度条可以消失了**
+           （因为第一个项目的任务已经结束）」
+
+        ⇒ 所以不是"每帧取队头"，而是**绑定一个**：
+          · **没绑定**时 ⇒ 取队头（第一个开始的未交付任务）并**绑定**；
+          · 绑定后 ⇒ 只要它还在未交付列表里 ⇒ 继续显示**它**；
+          · ★ **它一交付（出队）⇒ 取消绑定、返回空** —— 条**消失**，
+            **不接棒**给第二个项目（主人明说"可以消失"）；
+          · 直到"未交付列表彻底空了"（本轮全部结束）⇒ 解除禁令，下一轮重新绑定。
+        ★ 我第一版写的是"直接取队头" ⇒ A 交付后条会跳到 B ✗ 与主人的话不符。
+        """
+        tasks = self._open_tasks()
+        names = [pj for pj, _d in tasks]
+        if not names:
+            self._bar_owner = u""        # 本轮全结束 ⇒ 允许下一轮重新绑定
+            return u""
+        if self._bar_owner and self._bar_owner in names:
+            return self._bar_owner       # 绑定的那个还在跑 ⇒ 继续显示它
+        if self._bar_owner:
+            return u""                   # ★ 它交付了、但还有别的在跑 ⇒ **条消失**（不接棒）
+        self._bar_owner = names[0]       # 第一次绑定 = 第一个开始的
+        return self._bar_owner
+
     def _proj_ok(self):
-        u"""这条进度**是不是当前活跃项目写的**。
+        u"""这条进度**是不是队头项目写的**。
 
         ★★ 2026-09-23 17:3x：`progress.json` 是全局单文件 ⇒ 甲项目交付的 100%
           会在乙项目开工时顶出来（主人原话：「换个项目就出现这个问题了，
@@ -829,7 +993,11 @@ class FairyPet:
           容发布副本改名（`fairy-desktop-pet` vs `e-AI成图实践-Fairy`）。
         """
         pj = self.prog_project
-        cur = self._act_dir()
+        # ★ 2026-09-24：**队头**（第一个开始的未交付项目）—— 原来是"当前活跃项目"。
+        #   ★ 老验收（`v2_93` 等）用 `SimpleNamespace` 造**假 self** 单独验这段，
+        #     它们身上没有 `_bar_project` ⇒ **回落到老口径 `_act_dir()`**（行为不变）。
+        cur = (self._bar_project() if hasattr(self, "_bar_project")
+               else self._act_dir())
         if not pj or not cur:
             return True
         a, b = pj.lower(), cur.lower()
@@ -861,11 +1029,21 @@ class FairyPet:
         """
         _path = PROGRESS_FILE
         try:
-            _pj = self._act_dir()
+            # ★★★ 2026-09-24：从「当前活跃项目」改成「**队头**（第一个开始的未交付项目）」
+            #   —— 这一行就是"进度条认谁"的总开关（见 `_bar_project`）。
+            _pj = self._bar_project()
             if _pj:
                 _alt = proj_file(_pj)
                 if os.path.exists(_alt):
                     _path = _alt
+            elif self._prog_files():
+                # ★★ **队头为空、但 `_prog/` 里确实有文件** ⇒ 说明"所有项目都交付了"
+                #   （或者都失效了）⇒ **这一轮不该再画条**。
+                #   ⇒ 直接给"没有进度"，**不许回落全局那份** ——
+                #     全局那份可能留着**别的项目**刚交付的 100%（主人截图那条
+                #     「换个项目就出现这个问题了，刚进入工作态的时候，就是带工作条的」）。
+                #   ★ 而 `_prog/` 一个文件都没有（老环境 / 单项目自检）⇒ 仍然回落，行为不变。
+                return None, False, True, 0.0, False, u""
         except Exception:
             _path = PROGRESS_FILE
         try:
@@ -914,6 +1092,22 @@ class FairyPet:
         if self._prog_mtime <= self._bar_epoch:
             return False
         return True
+
+    def _prog_stale(self):
+        u"""条上这个数**是不是旧的** → `True/False`（陈旧 ⇒ 数字加 `≈` 并降亮）。
+
+        ★★ **判断放在这里（桌宠侧），绝不写进进度文件。**
+          理由：「新不新」是**时间的函数** —— 写进去 1 秒后就过期了
+          （文件写着 fresh、其实早旧了）⇒ **那等于让文件撒谎**。
+          ⇒ **后台只记事实（`ts` / 文件 mtime），判断留给看的人。**
+        ★ 数据**零新增**：`_prog_mtime` 本来就是 `_read_progress()` 的第 4 个返回值，
+          tick 里每 0.5 s 灌一次。
+        ★ 取不到时间（0）⇒ **不算陈旧** —— 宁可少标记，不许误报。
+        """
+        m = getattr(self, u"_prog_mtime", 0.0) or 0.0
+        if m <= 0:
+            return False
+        return (time.time() - m) > PROG_STALE_S
 
     def _bar_pct(self):
         u"""进度条**该显示**的百分比。
@@ -1086,6 +1280,17 @@ class FairyPet:
         #   ★ 注意 `active()` 仍然照调（上面那句）—— 它兼着"刷新时钟"的职责（见 REFERENCE V.10）。
         _cold = self._cold_boot()
         if _act_now and not _cold:
+            return "working"
+        # ★★★ 2026-09-24 主人定的规则：「**只要没发完结信号，工作态都不能退出**」
+        #   ⇒ 只要还有**未交付**的任务（**不管感知安不安静**）⇒ 一律 working。
+        #   为什么必须要这一条：模型"思考中"那几十秒 jsonl 一个字都不写
+        #   （实测 p90 间隔 10 s、最大 53 s），光靠感知判活跃 ⇒ **状态来回闪**。
+        #   ★ 放在 `_cold` 之后：**冷启动仍然优先**（主人定过"restart 后应是常态"）。
+        #   ★ 用 `getattr` 兜一下：几个老验收（`v2_22` / `v2_31` / `v2_82`…）是用
+        #     `SimpleNamespace` 造**假 self**、只注入 `_target_state` 单独验的 ——
+        #     它们身上没有这个方法。**给假 self / 老实例兜底，不影响真实例。**
+        _open = getattr(self, "_has_open_tasks", None)
+        if not _cold and _open is not None and _open():
             return "working"
         if self._settled or _cold:
             return "idle"
@@ -1502,6 +1707,20 @@ class FairyPet:
             pass
         return (txt, secs, kind) if txt else None
 
+    def _pop_note(self, text, secs=12.0, kind="work", why="note"):
+        """弹一张通知卡（**内部用** —— 不走 `notify.json`，比如重启问候）。
+
+        ★ 抽出来是为了让「读文件弹卡」和「内部弹卡」走**同一条路**
+          （`_note_up` 重判、清气泡、`_force_show`）—— 少一处手写就少一处漂移。
+        """
+        self.notify_text = text
+        self.notify_secs = max(3.0, float(secs))
+        self.notify_kind = kind or "work"
+        self.notify_t0 = time.perf_counter()
+        self._note_up = False        # ★ 新卡片：落位重判一次（见 _overlay）
+        self.bubble = None           # 通知优先：清掉正在显示的普通气泡
+        self._force_show(why)
+
     def _note_span(self, now):
         """返回 (文本, 不透明度, kind)；没通知或已过期 → None。淡入 0.25 s、淡出 0.5 s。"""
         if not self.notify_text:
@@ -1861,6 +2080,19 @@ class FairyPet:
     def tick(self):
         now = time.perf_counter()
         self._tick_n += 1
+        # ★★ STEP18 聊天窗（**另一个窗口**）每帧喂一次：
+        #   · 它自带 60 ms 节流 ⇒ 每帧调也不贵；
+        #   · **网络跑在它自己的后台线程里** ⇒ 这里只搬队列，不阻塞渲染
+        #     （硬要求：桌宠是 60 fps 的实时窗口，任何一次阻塞都看得出来）。
+        if self.chat is not None:
+            try:
+                self.chat.pump()
+            except Exception as e:
+                log_err("chat-pump", e)
+        # ★ 「单击桌宠 ⇒ 展开聊天窗」的**延迟判定**：等 280 ms，看这期间有没有双击。
+        if self._pending_click is not None and now - self._pending_click >= 0.28:
+            self._pending_click = None
+            self._toggle_chat()
         # ★ 「1% 台阶」的缓动要用**真实帧间隔**（帧率无关）—— 别写死 1/60
         _dt = (now - self._last_tick) if self._last_tick else (1.0 / 60.0)
         if self._last_tick:
@@ -1929,11 +2161,32 @@ class FairyPet:
             self.notify_poll_at = now
             n = self._read_notify()
             if n:
-                self.notify_text, self.notify_secs, self.notify_kind = n
-                self.notify_t0 = now
-                self._note_up = False        # ★ 新卡片：落位重判一次（见 _overlay）
-                self.bubble = None          # 通知优先：清掉正在显示的普通气泡
-                self._force_show("notify")  # ★ 万一窗口被系统藏了，弹卡前先把它亮出来
+                self._pop_note(n[0], n[1], n[2], why="notify")
+
+        # --- ★★ STEP20 重启问候（主人 2026-09-23 19:2x：「每次重启弹个通知框，写问候语，
+        #     增加时间判定，早上好/中午好/下午好/晚上好…做前缀，后面问候语从致谢的
+        #     那个 git 项目里摘抄」）---
+        #   ★ 三条约束，都不是随手写的：
+        #     ① **复用上面那条守卫**（状态与进度都读过、且不在开机动画里）——
+        #        否则会重现 2026-09-22 那次「黑条压在进度条上」（卡片与进度条三层重叠）。
+        #     ② 只在**没有真实通知**时弹 —— 我的工作通知（`notify.json`）是实时信息，
+        #        优先级永远高于寒暄。
+        #     ③ 有**时限**（`_greet_deadline`）：启动瞬间若正好有通知在弹，问候顺延；
+        #        但拖过 `GREET_GRACE_S` 就作罢（总不能在主人干活干到一半时突然问好）。
+        if (self._greet_pending and not self.notify_text
+                and self.state_read_at > 0.0 and self.prog_poll_at > 0.0
+                and not self._boot_guard):
+            self._greet_pending = False
+            if now < self._greet_deadline:
+                try:
+                    _txt, _info = GREET.compose()
+                    self._pop_note(_txt, _info["secs"], _info["kind"], why="greet")
+                    out(u"[greet] %s（%s）" % (_txt.replace(u"\n", u" ｜ "),
+                                             _info.get("scene") or u"-"))
+                except Exception as e:
+                    log_err("greet", e)
+            else:
+                out(u"[greet] 等了超过 %.0f s 才轮到 ⇒ 这次不问候了" % GREET_GRACE_S)
 
         # --- ★ 工作进度（我上报 progress.json）：与通知一样**无条件轮询** ---
         if now - self.prog_poll_at > 0.5:
@@ -2130,13 +2383,48 @@ class FairyPet:
         #   ★★ `self._bar_want`：主人定的时序 —— 没拆好任务之前**不画条**
         #      （旧版是"工作态一来就淡入"，已作废）。
         if self.bar is not None and self._bar_k > 0.02 and self._bar_want:
+            # ★★ 2026-09-28：副标题显示**当前项目短名**（原来是写死的 `FAIRY WORKING`）。
+            #   主人要"一眼看出这条在跟哪个项目" —— 旧行为下他把**临安**的 0%
+            #   误判成"文成的条卡住了"（2026-09-28 实拍）。
+            #   ★ 函数内 import：`set_caption` 在值没变时直接 return ⇒ 每帧调也安全。
+            try:
+                import fairy_notify as _N
+                self.bar.set_caption(_N.proj_short(self._bar_project()))
+            except Exception:
+                pass
+
             # ★ 传给合成的是**显示值** `_pct_shown()`（1% 台阶 + 缓动），不是目标值。
             self.bar.composite(bgra, alpha, self._pct_shown(), t_ms, self._bar_k,
-                               self._bar_rev)
+                               self._bar_rev, stale=self._prog_stale())
         self._blit(bgra, alpha)
         self._cost = 0.9 * self._cost + 0.1 * (time.perf_counter() - _t_in) * 1000.0
 
     # ------------------------------------------------------------ 消息
+    def _ensure_chat(self):
+        u"""懒创建聊天窗。**永不抛** —— 模块缺失或建窗失败就返回 None，桌宠照常跑。"""
+        if self.chat is not None:
+            return self.chat
+        if CHAT is None:
+            return None
+        try:
+            self.chat = CHAT.ChatWindow(log=lambda m: out(m))
+            out(u"[chat] 聊天窗已就绪（单击 Fairy 展开）")
+        except Exception as e:
+            log_err("chat-init", e)
+            self.chat = None
+        return self.chat
+
+    def _toggle_chat(self):
+        u"""单击桌宠 ⇒ 展开 / 收起聊天窗（贴在桌宠上方、右对齐）。"""
+        c = self._ensure_chat()
+        if c is None:
+            self._say(u"聊天窗不可用。", 2.0)     # ★ 兜底：让它说一句，而不是"点了没反应"
+            return
+        try:
+            c.toggle(anchor=(self.x, self.y, self.win, self.win))
+        except Exception as e:
+            log_err("chat-toggle", e)
+
     def _on_message(self, hwnd, msg, wparam, lparam):
         try:
             if msg == WM_NCHITTEST:
@@ -2162,6 +2450,9 @@ class FairyPet:
                     return 0
                 self.dragging = True
                 self.drag_off = (lx, ly)
+                # ★ STEP18：记下"按下"的时刻与位置 —— 抬起时用它判「这是单击还是拖动」
+                self._down_at = time.perf_counter()
+                self._down_pos = (lx, ly)
                 user32.SetCapture(hwnd)
                 return 0
             if msg == WM_MOUSEMOVE:
@@ -2190,11 +2481,26 @@ class FairyPet:
                 if self.dragging:
                     self.dragging = False
                     self._save_pos()
+                    # ★★ STEP18：**单击桌宠 ⇒ 展开 / 收起聊天窗**。
+                    #   判据两条一起用：位移 ≤ 5 px（否则是拖动）**且**按住 < 0.4 s
+                    #   —— 只判位移的话，长按也会被当成单击。
+                    #   ★ 但**不在这里执行**：双击时系统会先发一轮 DOWN/UP 再发 DBLCLK，
+                    #     立刻展开就会让"双击说话"变成"又开窗又说话"。
+                    #     ⇒ 记下来，280 ms 后在 `tick()` 里执行；期间来了 DBLCLK 就撤销。
+                    _ux = ctypes.c_short(lparam & 0xFFFF).value
+                    _uy = ctypes.c_short((lparam >> 16) & 0xFFFF).value
+                    _t = time.perf_counter()
+                    if (self._down_pos
+                            and abs(_ux - self._down_pos[0]) <= 5
+                            and abs(_uy - self._down_pos[1]) <= 5
+                            and (_t - self._down_at) < 0.4):
+                        self._pending_click = _t
                 if self.drag_slider:
                     self.drag_slider = None
                 user32.ReleaseCapture()
                 return 0
             if msg == WM_LBUTTONDBLCLK:
+                self._pending_click = None      # ★ 是双击 ⇒ 撤销"单击展开聊天窗"
                 self._say(random.choice(SPEAK), 2.4)
                 return 0
             if msg == WM_RBUTTONUP:
@@ -2507,6 +2813,27 @@ class FairyPet:
         #   `--smoke` 自检默认不烘（免得污染帧率测量）；`FAIRY_PREBAKE=1` 可强制开。
         if smoke <= 0 or os.environ.get("FAIRY_PREBAKE"):
             self._prebake_others()
+        # ★★ STEP20：**重启即问候**（主人 2026-09-23 19:2x 要求）。
+        #   只**置标记**，真正的弹卡在 tick 里（复用那条"状态与进度都读过"的守卫，
+        #   免得卡片与进度条三层重叠 —— 2026-09-22 栽过一次）。
+        #   ★ 三个"不弹"的场合：自测（`--selftest` 传 `max_frames`）、`--smoke`、
+        #     `--seconds` 之类**有限时长**的运行 —— 它们的目的是量帧率，
+        #     弹一张卡会多出绘制开销、还可能写掉 `greet_last.json`。
+        #     实测踩过：`--selftest` 传的是 `max_frames=180` 而 `smoke=0`，
+        #     早先只看 `smoke` 是不够的。
+        if (smoke <= 0 and max_frames <= 0 and seconds <= 0
+                and GREET is not None):
+            self._greet_pending = True
+            self._greet_deadline = time.perf_counter() + GREET_GRACE_S
+        # ★★ STEP18：**每日提炼**（主人 18:5x：「所有的懂主人的习惯都可以从历史记录里去
+        #   提炼，比如每天提炼一次，每次是在第一次启动或者重启的时候，后台提炼就行」）。
+        #   它自带 25 s 延时 + "今天做过就跳过"，失败只写日志；没配 key 会静默跳过
+        #   ⇒ 对桌宠本身零影响（自测 `--selftest` 不跑）。
+        if CHAT is not None and smoke <= 0:
+            try:
+                CHAT.start_daily_digest(log=lambda m: out(m))
+            except Exception as e:
+                log_err("digest-start", e)
 
         PM_REMOVE = 0x0001
         WM_QUIT = 0x0012
@@ -2588,6 +2915,13 @@ class FairyPet:
         try:
             gdi32.DeleteObject(self._dib)
             gdi32.DeleteDC(self._hdc)
+            # ★ STEP18：聊天窗是**另一个窗口**，得自己销毁 + 注销它的窗口类
+            #   （同进程二次 `RegisterClassExW` 必失败，这是本项目的老坑）
+            if self.chat is not None:
+                try:
+                    self.chat.destroy()
+                except Exception:
+                    pass
             user32.DestroyWindow(self.hwnd)
         except Exception:
             pass
@@ -2662,9 +2996,12 @@ def selftest(size=SIZE, frames=180, only=None):
         n = max(pet._tick_n, 1)
         a = {k: acc[k] / n * 1000.0 for k in acc}
         # ★ 即时打印：数据先落地，别攒到最后（下一轮若崩，攒着的全丢）。
-        print("[selftest]   %-6s 渲染 %6.2f ｜ 装箱 %6.2f ｜ 上屏 %6.2f ｜ 三段合计 %6.2f ｜ tick总 %6.2f ms（n=%d）"
-              % (lab, a["draw"], a["pack"], a["blit"], sum(a.values()), pet._cost, n),
-              flush=True)
+        # ★★ 2026-09-23 19:3x：这里原来是 `print(..., flush=True)` ——
+        #   **pythonw 下必崩**（实测 `OSError: [Errno 22]`，堆栈记在 pet_error.log）。
+        #   项目的铁律第 3 条写的就是"`flush()` 当场崩、输出全走 `out()`"，
+        #   而这行**漏在铁律之外**。改成 `out()`（它自带 flush + 异常兜底）。
+        out("[selftest]   %-6s 渲染 %6.2f ｜ 装箱 %6.2f ｜ 上屏 %6.2f ｜ 三段合计 %6.2f ｜ tick总 %6.2f ms（n=%d）"
+            % (lab, a["draw"], a["pack"], a["blit"], sum(a.values()), pet._cost, n))
         pet = None          # ★ 用 None 而**不是 `del`**：显式 del 会立刻释放 ctypes 回调
         #   对象（WNDPROC），交给 GC 更省心。
     STATE_FILE = orig_state_file

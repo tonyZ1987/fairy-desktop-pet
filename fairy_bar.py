@@ -81,6 +81,13 @@ CAP_GAIN = 0.85 * 1.50                  # ★ 主人："英文字体放大到现
 #   只在 `step17_hdd_progress.py`（v4 设计稿）里，**生产渲染器从来没接**。
 #   现在按设计稿的样式补回：条**下方**、居中、描边斜体（深浅桌面都读得清）。
 CAPTION = "FAIRY WORKING"
+# ★★ 2026-09-28 主人同意加「新鲜度」：条上的数字**不是刚写下的**时，
+#   写成 `≈65%` 并轻微降亮 —— 免得他把一个**旧数**当成"现在的进度"
+#   （09-28 实拍：临安的 0% 残留被他读成"文成的条卡住了"）。
+#   ★ 为什么是「约」：一轮之内进度**只增不减** ⇒ 旧的数天然是**下界**，
+#     `≈65%` 的准确意思是「至少 65%，可能更多」—— 这是诚实的说法。
+STALE_PREFIX = u"\u2248"      # 陈旧前缀（≈）
+STALE_DIM = 0.72               # 陈旧时数字整体降亮（只压 alpha，颜色不动）
 CAPTION_ENABLE = True
 CAP_TRACK = 0.24                        # 字距 —— 照设计稿的 SUB_TRACK
 CAP_GAP_F = 0.35                        # 条底 → 副标题顶 的间隙 / 条高
@@ -163,16 +170,22 @@ def geom(S, cap_h=0):
 _CAP = {}
 
 
-def caption_rgba(px):
-    """副标题位图（描边斜体 + 内外发光），按字号缓存 —— 与 `number_rgba` 同一套字体处理。"""
-    key = int(px)
+def caption_rgba(px, text=None):
+    """副标题位图（描边斜体 + 内外发光），按 **(文字, 字号)** 缓存。
+
+    ★ 2026-09-28：加 `text` —— 副标题从写死的 `CAPTION` 改成**项目短名**
+      （主人要"一眼看出条在跟哪个项目"）。★ `text` 放**第二位**且可为空，
+      老的 `caption_rgba(px)` 调用照旧可用。
+    """
+    txt = (text or CAPTION)
+    key = (txt, int(px))
     hit = _CAP.get(key)
     if hit is not None:
         return hit
     import step17_hdd_progress as S17
     s = TEXT_STYLE["cap"]
-    _dk, _lk = _stroke_k(s, key)
-    t = S17.styled_text(CAPTION, key, track=CAP_TRACK,
+    _dk, _lk = _stroke_k(s, key[1])
+    t = S17.styled_text(txt, key[1], track=CAP_TRACK,
                         glow_r=s["glow_r"], glow_a=s["glow_a"],
                         dark_k=_dk, light_k=_lk,
                         face_top=s["face_top"], face_bot=s["face_bot"],
@@ -311,24 +324,38 @@ def _stroke_k(style, px):
     return style["dark_k"], style["light_k"]          # 向后兼容（旧式比例档）
 
 
-def number_rgba(pct_int, px):
+def _dim_rgba(im, k):
+    u"""整幅按比例压低 alpha → 新图（**只动 alpha，不动颜色**）。
+
+    ★ 只压 alpha 的观感是"淡下去"，不是"变黑/变灰" —— 数字压在进度条上，
+      改颜色会让它在不同的底色上偏色（条是蓝的、空槽是暗的）。
+    """
+    r = im.copy()
+    r.putalpha(im.getchannel("A").point(lambda v: int(v * k)))
+    return r
+
+
+def number_rgba(pct_int, px, stale=False):
     """中央百分比数字（复用 `step17_hdd_progress.styled_text`：粗斜体 + 描边 + 渐变 + 发光）。
 
     ★ 单次生成约 **3 ms**（有高斯发光），所以必须缓存；并把 0/5/…/100 预热掉。
     """
-    key = (int(pct_int), int(px))
+    key = (int(pct_int), int(px), bool(stale))
     hit = _NUM.get(key)
     if hit is not None:
         return hit
     import step17_hdd_progress as S17
     s = TEXT_STYLE["num"]
     _dk, _lk = _stroke_k(s, key[1])          # ★ 绝对宽 ⇒ 比例（不随字号变粗）
-    t = S17.styled_text("%d%%" % key[0], key[1], track=0.10,
+    _txt = u"%s%d%%" % (STALE_PREFIX if stale else u"", key[0])
+    t = S17.styled_text(_txt, key[1], track=0.10,
                         glow_r=s["glow_r"], glow_a=s["glow_a"],
                         dark_k=_dk, light_k=_lk,
                         face_top=s["face_top"], face_bot=s["face_bot"],
                         dark_col=s["dark_col"], edge_col=s["edge_col"],
                         dark_a=s["dark_a"])
+    if stale:
+        t = _dim_rgba(t, STALE_DIM)      # ★ 降亮放在**缓存之前**（缓存的是成品）
     if len(_NUM) >= _NUM_CAP:
         _NUM.pop(next(iter(_NUM)))       # 只淘汰最老的一条，不再整表清空
     _NUM[key] = t
@@ -352,17 +379,37 @@ class BarView:
         self.h_base = self.w / ASPECT
         self.num_px = max(7, int(round(self.h_base * NUM_F * NUM_GAIN)))
         self.cap_px = max(7, int(round(self.h_base * CAP_GAIN)))
-        self.cap = caption_rgba(self.cap_px) if CAPTION_ENABLE else None
-        self.cap_gap = max(2, int(round(self.h * CAP_GAP_F))) if self.cap is not None else 0
-        self.w, self.h, self.x, self.y = geom(S, self.cap.height if self.cap is not None else 0)
-        self.cap_x = int((self.S - self.cap.width) / 2.0) if self.cap is not None else 0
-        self.cap_y = self.y + self.h + self.cap_gap
+        # ★ 2026-09-28：副标题文字**可变**（项目短名）。默认仍是 `CAPTION`。
+        self.cap_text = CAPTION
+        self._layout()
         self.per_px = BAR_MOIRE_PER_U * self.ppu
         self._solid, self._moire = {}, {}
         self._box = None
         self._x0 = self._y0 = 0
 
     # ---------- 内部 ----------
+    def _layout(self):
+        u"""按当前 `cap_text` 重算**副标题位图与几何**。
+
+        ★ 副标题的高度参与布局（`geom(S, cap.height)`）⇒ 换文字（项目短名）时
+          **必须重算这几个量**，否则条与副标题会错位。
+        ★ `_solid` / `_moire` **不用清** —— 它们只跟条的 pct 与相位有关，与 `cap` 无关。
+        """
+        self.cap = caption_rgba(self.cap_px, self.cap_text) if CAPTION_ENABLE else None
+        self.cap_gap = max(2, int(round(self.h * CAP_GAP_F))) if self.cap is not None else 0
+        self.w, self.h, self.x, self.y = geom(
+            self.S, self.cap.height if self.cap is not None else 0)
+        self.cap_x = int((self.S - self.cap.width) / 2.0) if self.cap is not None else 0
+        self.cap_y = self.y + self.h + self.cap_gap
+
+    def set_caption(self, text):
+        u"""换副标题文字（**项目短名**）—— 值没变就直接返回，所以**每帧调也安全**。"""
+        t = (text or u"").strip() or CAPTION
+        if t == self.cap_text:
+            return
+        self.cap_text = t
+        self._layout()
+
     def _s(self, p):
         im = self._solid.get(p)
         if im is None:
@@ -384,7 +431,7 @@ class BarView:
         """通知卡的底边该落在哪（有进度条时往上让位）。"""
         return self.y - int(round(CARD_GAP_F * self.S))
 
-    def bake(self, pct, t_ms, k=1.0, rev=None):
+    def bake(self, pct, t_ms, k=1.0, rev=None, stale=False):
         """→ (x0, y0, RGBA 缓冲) 或 None。把 条 + 横纹 + 数字 合到**一小块**缓冲里。
 
         区域 = 条矩形 ∪ 数字矩形 ∪ 副标题矩形（出现动画时再向下扩出数字云的落点）。
@@ -401,7 +448,9 @@ class BarView:
         ph = int(((t_ms / M.GLOW_CYCLE_MS) % 1.0) * MOIRE_PHASES) % MOIRE_PHASES
         b = self._box or solid(self.w, self.h, 0.0)[1]
         self._box = b
-        n = number_rgba(p, self.num_px)          # ★ 挂基准高，见 __init__ 的说明
+        n = number_rgba(p, self.num_px, stale)   # ★ 挂基准高，见 __init__ 的说明
+        #   ★ `≈` 会让数字变宽 ⇒ 下面的 `nx = (S - n.width) / 2` 自动重新居中，
+        #     不用另外算偏移；合成包围盒也按 `n.width` 张，不会被裁。
         nx = int((self.S - n.width) / 2.0)
         ny = int(self.y + self.h / 2.0 - n.height / 2.0)
         # ★★ 出现动画 = **PPT 式淡入**（2026-09-23 00:0x 主人改口径，见文件头的说明）：
@@ -460,13 +509,13 @@ class BarView:
             buf.putalpha(buf.getchannel("A").point(lambda v: int(v * k)))
         return self.x, self.y, buf
 
-    def draw_on(self, cv, pct, t_ms, k=1.0, rev=None):
+    def draw_on(self, cv, pct, t_ms, k=1.0, rev=None, stale=False):
         """把进度条画到**整幅画布 RGBA** 上（设计稿 / 预览脚本用）。"""
-        r = self.bake(pct, t_ms, k, rev)
+        r = self.bake(pct, t_ms, k, rev, stale)
         if r:
             cv.alpha_composite(r[2], (r[0], r[1]))
 
-    def composite(self, bgra, alpha, pct, t_ms, k=1.0, rev=None):
+    def composite(self, bgra, alpha, pct, t_ms, k=1.0, rev=None, stale=False):
         """★ 主程序走这条：把进度条**局部**合成到 `to_bgra()` 的结果上。
 
         公式与 `fairy_layers.to_bgra(ov=...)` 完全一致（source-over，直色 × alpha），
@@ -478,10 +527,10 @@ class BarView:
            —— 我在预览图上亲眼看到才发现（代码不报任何错）。
 
         `rev`：出现动画进度 0..1（None = 已经出现完）。
+        `stale`：这个数**是不是旧的**（见 `fairy_pet.PROG_STALE_S`）——
+          陈旧 ⇒ 数字写成 `≈65%` 并降亮。**判断在外面做，这里只负责呈现。**
         """
-        r = self.bake(pct, t_ms, k, rev)
-        if r is None:
-            return
+        r = self.bake(pct, t_ms, k, rev, stale)
         x0, y0, buf = r
         o = np.asarray(buf, dtype=np.uint8)
         a = o[..., 3].astype(np.uint16)

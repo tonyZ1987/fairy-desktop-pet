@@ -28,3 +28,15 @@ env/
 *~
 Thumbs.db
 desktop.ini
+
+# ---------- v2.2：一键桥接 / 进度，都是本机运行态 ----------
+progress.json
+_prog/
+agent_bridge_report.txt
+agent_bridge_summary.txt
+fairy_bridge.log
+fairy_bridge_off
+hook_sessions.json
+activity_project.txt
+*.bak_fairy_*
+*.bak_junk_*

@@ -178,8 +178,15 @@ WORK_TOP = 90.0                    # 0~90：实际工作，N 项等分
 MEMO_TOP = 95.0                    # 90~95：我写记忆 / 落盘
 PHASE_CUM = (0.30, 0.80, 1.00)     # 每项内累计：计划思考 30% ⇒ +搜索修改 50% ⇒ +落位成果 20%
 PHASE_NAMES = (u"计划思考", u"搜索修改", u"落位成果")
-SETTLE_S = 180.0                   # 交付后**最多**挂多久等主人开口（写进 progress.json 给它看）
+SETTLE_S = 60.0                    # 交付后**最多**挂多久等主人开口（写进 progress.json，要与 `fairy_pet.DONE_SETTLE_S` **一致**）
+                                   #   ★ 2026-09-23 20:2x：180 → 60（主人定）。
 WORK_TTL_S = 120.0                 # ★★ 2026-09-23 17:1x 主人：「你回复完都过了这么久，还在半睁眼状态？」
+REPLY_TTL_S = 300.0               # ★★ 2026-09-23 20:1x：交付（`--reply`）写 `state.json`
+                                   #   的**兜底**超时。原来给 2700（45 min）—— 正常靠
+                                   #   `settle` 的 60 s 收尾，长 ttl 平时看不出来；
+                                   #   **但收尾一旦被「主人开口」复位就不重启计时**
+                                   #   （判据是 settle 记录的 mtime，它没变）⇒ 那时只剩
+                                   #   ttl 兜底 ⇒ 最坏顶着 45 分钟。改成 5 分钟。
                                    #   根因：**无进度条的任务（纯问答）只发 `--work`** —— 它把
                                    #     `state.json` 写成 working 且 `ttl=2700`（45 min），而收尾
                                    #     原来**只挂在 `--reply` 的 done/settle 上** ⇒ 感知一安静，
@@ -275,22 +282,69 @@ def strip_redundant_head(body):
     return rest
 
 
-def build_text(kind, body, no_prefix=False, suffix=True):
-    """拼出最终文案。`done` 的收尾会补一句"请前往查阅"（★ 已经写过就别再加）。"""
-    prefix = KINDS.get(kind, ("", "idle"))[0]
+def build_text(kind, body, no_prefix=False, suffix=True, head=None):
+    """拼出最终文案。`done` 的收尾会补一句"请前往查阅"（★ 已经写过就别再加）。
+
+    ★ `head` 显式给出时**顶替** `KINDS[kind]` 的抬头 —— 2026-09-24 主人要交付卡的
+      抬头是**项目短名**（"哪个项目完成了"一眼可见），"已完成"改到正文里。
+    """
+    prefix = head if head else KINDS.get(kind, ("", "idle"))[0]
     body = strip_redundant_head(body)
     if no_prefix or not prefix:
         return body
     s = "%s：%s" % (prefix, body)
-    # ★★ 2026-09-23 实测抓到：判据得先**去掉句末标点**再比对。
-    #    原来直接 `body.rstrip().endswith(("阅","看"))` —— 我写的句子末尾是"。"，
-    #    判不出来 ⇒ 又补一句 ⇒ 屏幕上出现「…请前往查阅。。请前往查阅。」
-    tail = body.rstrip(u"。！？!?. ")
-    if kind == "done" and tail and not tail.endswith((u"阅", u"看")):
-        # ★ 拼接前要**先把 `s` 末尾的标点去掉** —— 上面那个 `tail` 只用于"判要不要补"，
-        #   拼接用的还是带标点的 `s` ⇒ 文案自己带「。」时会拼成「…vbs。。请前往查阅。」
-        s = s.rstrip(u"。！？!?. ") + u"。请前往查阅。"
+    if kind == "done":
+        s = _ensure_tail(s)
     return s
+
+
+def _ensure_tail(s):
+    u"""交付卡收尾补「。请前往查阅。」—— **已经写过就别再加**。
+
+    ★ 2026-09-23 实测抓到：判据得先**去掉句末标点**再比对，否则会出现
+      「…请前往查阅。。请前往查阅。」（拼接用的串自己带「。」）。
+    """
+    tail = s.rstrip(u"。！？!?. ")
+    if tail and not tail.endswith((u"阅", u"看")):
+        return s.rstrip(u"。！？!?. ") + u"。请前往查阅。"
+    return s
+
+
+SPACE_WORD = u"工作空间的项目"      # ★ 主人 2026-09-24 定的句式用词
+
+
+def done_card(body, n=None):
+    u"""交付 / 完成卡的最终文案。
+
+    ★★ **主人 2026-09-24 定稿的句式**（覆盖前一天那版"抬头 = 项目短名"）：
+        `主人，"XXX"工作空间的项目已完成XXX项修改，XXXX`
+        原话：「**不要把项目空间名称写前面**」⇒ 项目名要**嵌进句子当主语**。
+
+    ★ 三条口径：
+      ① **不设抬头** —— "已完成"已经在句子里，再加一层「已完成：」就是重复；
+      ② 正文若以「（称呼，）已完成…」起头 ⇒ 把 `"短名"工作空间的项目` 插在称呼之后；
+         **不是这个形状就不插**（硬插会拗口 —— 今天刚被实拍教训：会拼出
+         "已完成交付卡抬头已改成…"这种两个"已"顶嘴的句子）；
+      ③ **done 卡永不设抬头** ⇒ 拿不到项目名就纯正文（
+         `主人，已完成2项修改，请前往查阅。`）—— 不加「已完成：」，否则会与正文重复。
+    ★ `--reply` 与旧写法 `--done` **共用这一个出口** —— 免得两条路的卡片形态又分叉。
+    """
+    b = (body or u"").strip()
+    if not b:
+        # ★ 没给正文 ⇒ 按句式生成默认那句（"已完成"三个字**自己带着**，不靠硬补）
+        b = (u"主人，已完成%d项修改，请前往查阅。" % n if n
+             else u"主人，已完成本次任务，请前往查阅。")
+    short = proj_short(current_project())
+    lead = u""
+    for p in (u"主人，", u"主人：", u"主人,", u"主人:", u"主人 "):
+        if b.startswith(p):
+            lead, b = p, b[len(p):]
+            break
+    # ★★ **done 卡永不设抬头** —— 正文自己就带着「已完成」，再加一层「已完成：」
+    #    就是重复（实测会拼出 `已完成：已完成2项修改…`）。
+    if short and b.startswith(u"已完成"):
+        return _ensure_tail(u'%s"%s"%s%s' % (lead, short, SPACE_WORD, b))
+    return _ensure_tail(lead + b)
 
 
 def set_progress(pct, note="", done=False, planned=True, **extra):
@@ -315,6 +369,21 @@ def set_progress(pct, note="", done=False, planned=True, **extra):
     _pj = current_project()
     if _pj:
         d["project"] = _pj
+    # ★★★ 2026-09-24：**多项目排队规则**（主人原话）：
+    #   「进度条只显示**第一个开始**的项目的任务，其余项目开始发的信号列入排队序列」
+    #   ⇒ 写一个 `started_at` = **本轮开工时刻**，桌宠拿它排先后。
+    #   ★ 只在"**新一轮开工**"时设：还没有 `started_at`，或上一条是 `done`（已交付过）。
+    #     `--plan` / `--item` / `--memo` **不覆盖**（它们都属于同一轮）；
+    #     `--reply`（`done=True`）也**不动**它 —— 交付与否由 `done` 表达，不靠清 `started_at`。
+    if _pj:
+        try:
+            _old = read_progress(_pj)
+            if not done and (not _old.get("started_at") or _old.get("done")):
+                d["started_at"] = time.time()
+            elif _old.get("started_at"):
+                d["started_at"] = _old["started_at"]
+        except Exception:
+            d["started_at"] = time.time()
     d.update(extra)
     atomic_write(PROGRESS, d)
     # ★★ 专属文件：两个项目同时跑时，全局那份会被**后写的覆盖**
@@ -328,6 +397,36 @@ def set_progress(pct, note="", done=False, planned=True, **extra):
         except Exception:
             pass
     return v
+
+
+def do_abort(note=""):
+    u"""作废本轮的进度（**主人终止任务** / 我切项目时发现上一轮没走完）。
+
+    ★★ 与 `--reply`（交付）**语义相反**：交付是"做完了"，作废是"**不做了**"。
+    ★ 桌宠看到 `abort: true` ⇒ **不等超时、立刻**把这条从"未交付队列"里摘掉 ⇒
+      要是没有别的任务在跑，**立刻回常态**。主人 2026-09-28 原话：
+      「一旦我终止的任务，那么立即退出工作态，回到常态」。
+    ★ `started_at` 一并清掉 —— 下次真要做就是**新一轮**，不该沿用旧的开工时刻。
+    """
+    _pj = current_project()
+    d = read_progress(_pj) or {}
+    _was = d.get("percent")
+    d.update({"abort": True, "done": False, "planned": True,
+              "ts": time.time(),
+              "note": note or u"已作废（主人终止 / 切项目时清残留）"})
+    d.pop("started_at", None)
+    if _was is not None:
+        d["aborted_at_pct"] = _was          # 留个痕：作废时条走到哪了（诊断用）
+    atomic_write(PROGRESS, d)
+    # ★ 专属文件同样要写 —— 桌宠排队读的就是它（见 `set_progress` 的说明）
+    if _pj and not _ISOLATED:
+        try:
+            if not os.path.isdir(PROGRESS_DIR):
+                os.makedirs(PROGRESS_DIR)
+            atomic_write(prog_file(_pj), d)
+        except Exception:
+            pass
+    return d
 
 
 def read_progress(project=None):
@@ -435,7 +534,166 @@ def do_stage(k, note=""):
     return kk, n, v
 
 
-def do_reply(p=5.0, text="", note="", secs=12.0, ttl=2700.0):
+# ★★ 2026-09-28：短名的三层回落（主人问「短名的命名规则该怎么写」）。
+#   `~/.workbuddy/projects/` 下每个项目目录名 = 项目根路径按规则编码，
+#   本机实测有**两种形态**，见 `proj_short()` 的说明。
+PROJECTS_ROOT = os.path.join(os.path.expanduser(u"~"), u".workbuddy", u"projects")
+SHORT_MAX = 12          # 条副标题位 / 完成卡都按这个长度收（200 档实测放得下；
+                        #   ★ 别小于 11 —— `miniprogram` 这种词会被切残）
+SHORT_TTL = 60.0        # 短名缓存秒数（`aiTitle` 会变，但桌宠可能每帧问，不能每帧读盘）
+_SHORT_CACHE = {}
+
+
+def _clip(s, n=SHORT_MAX):
+    u"""压到 `n` 字以内：**优先在标点处断**（读起来像话），断不了才硬截加省略号。"""
+    s = (s or u"").strip()
+    if len(s) <= n:
+        return s
+    head = s[:n]
+    # ★ 标点表要含**引号/括号**：`研判“跑了吗”小程序可行性` 应在右引号处断成
+    #   `研判“跑了吗”`，而不是硬截成 `研判“跑了吗”小程序可…`。
+    # ★ 从**整段末尾**往前找（不设"只找 5 个字符"的限制）——否则
+    #   `研判“跑了吗”小程序可行性` 会在右引号（第 6 字）之前找不到标点、被硬截。
+    #   ★ 但**最短留 4 字**，免得一路退到开头切出个"研判"。
+    # ★★ 分两类：**引号/括号要留着**（`研判“跑了吗”`），逗号句号这类**丢掉**
+    #   （`张三，` 那种尾巴没必要）；`-` 也要在表里（`miniprogram-dev` ⇒ `miniprogram`）。
+    for i in range(len(head) - 1, 3, -1):
+        if head[i] in u"“”‘’「」《》（）()":
+            return head[:i + 1]
+        if head[i] in u"，。、；：·！？ 　-/｜|":
+            return head[:i]
+    return head[:n - 1] + u"…"
+
+
+def _ai_title(pj):
+    u"""读该项目**最新会话**里的 `aiTitle` → 短名（读不到 → 空串）。
+
+    ★ 为什么用它：`c-Users-…-WorkBuddy-2026-08-04-15-00-12` 这种目录名**没有任何语义**，
+      而 `aiTitle` 是 `爬取小红书抖音拼多多数据调研` 这种**人话** —— 任何形态都成立。
+    ★ 只读**头尾各 256 KB**：标题通常在会话开头生成，也可能后面被更新；
+      大文件（实测有 100 MB 的）不整读。
+    ★ 任何异常一律返回空串 ⇒ 走回落，**绝不影响主流程**。
+    """
+    d = os.path.join(PROJECTS_ROOT, pj)
+    try:
+        names = [x for x in os.listdir(d) if x.endswith(u".jsonl")]
+    except Exception:
+        return u""
+    if not names:
+        return u""
+    paths = []
+    for x in names:
+        p = os.path.join(d, x)
+        try:
+            paths.append((os.path.getmtime(p), p))
+        except OSError:
+            continue
+    if not paths:
+        return u""
+    paths.sort()
+    latest = paths[-1][1]
+    chunks = []
+    try:
+        sz = os.path.getsize(latest)
+        # ★★ 用**内置 `open`**，不用 `io.open` —— 本模块**没有 import io**，
+        #    第一版就是这里抛 `NameError` 被下面的 except 吞掉、静默返回空（实测）。
+        with open(latest, "rb") as f:
+            if sz <= 512 * 1024:
+                chunks.append(f.read())
+            else:
+                chunks.append(f.read(256 * 1024))
+                f.seek(sz - 256 * 1024)
+                chunks.append(f.read())
+    except Exception as e:
+        # ★★ **不再裸吞**：同一个坑（异常被 except 吃掉、表现成"什么都没发生"）
+        #    09-24 已经栽过一次（`NameError` 让 `_prog_files` 静默扫不到文件）。
+        sys.stderr.write(u"[proj_short] 读会话失败：%s\n" % e)
+        return u""
+    found = u""
+    for raw in chunks:
+        for line in raw.decode(u"utf-8", u"replace").splitlines():
+            if u'"aiTitle"' not in line:
+                continue
+            try:
+                v = json.loads(line).get(u"aiTitle")
+            except Exception:
+                continue
+            if isinstance(v, str) and v.strip():
+                found = v.strip()          # ★ 取**最后一条**（标题可能被更新过）
+    return _clip(found)
+
+
+def _is_stamp(pj):
+    u"""这个目录名是不是 WorkBuddy 的**默认工作目录**（`…-<时间戳>`）？
+
+    ★ 判据：时间戳被 `-` 拆成六段（`2026/08/04/15/00/12`）⇒ **末两段都是 1~2 位数字**。
+      这种目录名**没有任何语义**（旧规则给出 `00-12`，实测）。
+    """
+    parts = [x for x in pj.split(u"-") if x]
+    return (len(parts) >= 3
+            and bool(re.match(u"^[0-9]{1,2}$", parts[-1]))
+            and bool(re.match(u"^[0-9]{1,2}$", parts[-2])))
+
+
+def _seg_short(pj):
+    u"""目录名末段 —— **只在它真的有意义时**才给名字（时间戳目录 ⇒ 返回空串）。
+
+    ★★ 优先级是**实测后倒过来定的**（第一版写成 aiTitle 优先，跑真实数据发现错了）：
+      · `d-郑丁铭-…-PDF-20260920` ⇒ 主人认 `20260920`，**不**认 aiTitle 那句
+        `继续文成项目：查看进度…` ⇒ **他建的目录名优先** ✓
+      · `c-Users-…-WorkBuddy-2026-08-04-15-00-12` ⇒ 目录名毫无语义 ⇒ **交回空串**，
+        让 `proj_short` 去问会话的 `aiTitle`（那才有人话）。
+    """
+    if _is_stamp(pj):
+        return u""
+    parts = [x for x in pj.split(u"-") if x]
+    if not parts:
+        return _clip(pj)
+    tail = parts[-1]
+    if len(tail) < 4 and len(parts) >= 2:
+        # ★ 别再**截前一段**（`miniprogram` 被切 8 字 ⇒ `iprogram` 就是这么来的）。
+        tail = parts[-2] + u"-" + tail
+    return _clip(tail)
+
+
+def _seg_date(pj):
+    u"""时间戳目录的**兜底**名字：从尾部往回找 4 位年份 ⇒ 给 `08-04`。"""
+    parts = [x for x in pj.split(u"-") if x]
+    for i in range(len(parts) - 1, -1, -1):
+        if not re.match(u"^[0-9]{4}$", parts[i]):
+            continue
+        if (i + 2 < len(parts)
+                and re.match(u"^[0-9]{1,2}$", parts[i + 1])
+                and re.match(u"^[0-9]{1,2}$", parts[i + 2])):
+            return u"%s-%s" % (parts[i + 1].zfill(2), parts[i + 2].zfill(2))
+        return parts[i]
+    return _clip(pj)
+
+
+def proj_short(pj):
+    u"""项目目录名 → 条副标题 / 卡片上用的**短名**（主人要"一眼看出是哪个项目"）。
+
+    ★★ 2026-09-28 重做 —— 旧规则只取末段，在**没有语义的目录名**上会给出
+      `00-12` / `iprogram-dev` 这种东西（本机实测）。新规则**三层回落**：
+        ① **目录末段** —— 主人自己建的项目（`20260920` / `方案公示` / `Fairy`）：**他认这个**
+        ② 目录名是**默认工作目录**（`…-<时间戳>`，没有语义）⇒ 用 **`aiTitle`**（人话）
+        ③ 都没有 ⇒ 日期兜底（`08-04`）
+        ★ 第一版把 ①② 写反了 —— 跑真实数据才发现（`20260920` 被换成
+          `继续文成项目：查看进度…`，反而不好认）。
+    ★ 带 60 秒缓存：桌宠可能每帧问，不能每帧读盘。
+    """
+    if not pj:
+        return u""
+    now = time.time()
+    hit = _SHORT_CACHE.get(pj)
+    if hit and now - hit[0] < SHORT_TTL:
+        return hit[1]
+    name = _seg_short(pj) or _ai_title(pj) or _seg_date(pj)
+    _SHORT_CACHE[pj] = (now, name)
+    return name
+
+
+def do_reply(p=5.0, text="", note="", secs=12.0, ttl=None):
     u"""④ 写回复 / 交付（95~100%）。
 
     ★ **只有走到 100% 才收尾**：弹完成卡 + 写 `settle` + 状态留在 `working`
@@ -452,11 +710,11 @@ def do_reply(p=5.0, text="", note="", secs=12.0, ttl=2700.0):
                      stages=n, item=n, phase=len(PHASE_CUM))
         return v, False, u""
     # === 100%：交付收尾 ===
-    body = (text or "").strip()
-    if not body:
-        body = (u"主人，%d 项修改已全部完成，请前往查阅。" % n if n
-                else u"主人，任务已完成，请前往查阅。")
-    card = build_text("done", body, no_prefix=False)
+    # ★ `ttl=None` = 调用方没指定 ⇒ 用交付档的兜底（见 `REPLY_TTL_S`）
+    if ttl is None:
+        ttl = REPLY_TTL_S
+    # ★ 空正文交给 `done_card` 按主人定的句式生成（见它），这里不再自己拼
+    card = done_card((text or u"").strip(), n)
     atomic_write(NOTIFY, {"text": card, "ts": time.time(), "secs": secs, "kind": "done"})
     set_progress(100, u"交付完成（%d 项）" % n, planned=True, done=True,
                  settle=True, settle_s=SETTLE_S, stages=n, item=n,
@@ -480,7 +738,7 @@ def main():
     ap.add_argument("--work", action="store_true", help="开工（state.json → working，半睁眼；进度归 0）")
     ap.add_argument("--stay", action="store_true", help="只弹卡，绝不动 state.json")
     ap.add_argument("--secs", type=float, default=12.0, help="卡片停留秒数（默认 12）")
-    ap.add_argument("--ttl", type=float, default=2700.0, help="working 的兜底超时秒数（默认 2700）")
+    ap.add_argument("--ttl", type=float, default=None, help="working 的兜底超时秒数（默认 2700）")
     ap.add_argument("--progress", type=float, default=None, metavar="N",
                     help="上报工作进度 0~100（只写 progress.json，不弹卡、不动状态）")
     ap.add_argument("--plan", type=int, default=None, metavar="N",
@@ -504,7 +762,20 @@ def main():
                     help="允许 --item 跳格（默认会拦住漏报：台阶必须一格一格走）")
     ap.add_argument("--note", default=None, help="给 --plan/--stage/--item/--memo 附一句说明（只记进 progress.json）")
     ap.add_argument("--progress-clear", action="store_true", help="删掉 progress.json（工作态不再显示进度条）")
+    # ★★ 2026-09-28：主人终止任务 ⇒ 立刻作废（桌宠**不等超时**就退出工作态）
+    ap.add_argument("--abort", action="store_true",
+                    help="作废本轮进度（主人终止任务 / 我切项目时清残留）⇒ 桌宠立刻退工作态")
     a = ap.parse_args()
+
+    # ---- ★★ 0 最高优先级：作废本轮进度 ----
+    #   与 `--reply` 相反：交付是"做完了"，作废是"**不做了**"。
+    #   主人 2026-09-28：「一旦我终止的任务，那么立即退出工作态，回到常态」。
+    if a.abort:
+        _pj = current_project()
+        do_abort(a.note or "")
+        print(u"已作废 %s 的本轮进度 ⇒ 桌宠**立刻**把它移出队列（不等超时）"
+              % (_pj or u"(未知项目)"))
+        return
 
     # ---- ② 第 K 项的第 P 阶段完成（0~90%）----
     if a.item is not None:
@@ -578,7 +849,12 @@ def main():
     kind = a.kind or ("done" if a.done else ("work" if a.work else None))
     # ★★ `--work` / `--done` **允许不带文案**（只切状态）—— 开工那一下本来就不必弹卡
     #    （主人要的是"进工作态、没进度条"，不是"弹一张卡"）。没文案 ⇒ `text=""`。
-    text = build_text(kind, body, a.no_prefix) if body else u""
+    # ★★ 2026-09-24：**完成卡一律带项目短名**（与 `do_reply` 同一口径）——
+    #   否则"哪个项目完成了"只在 `--reply` 那条路成立，旧写法 `--done` 又不一致了。
+    if body and kind == "done" and not a.no_prefix:
+        text = done_card(body)                       # ★ 完成卡：统一出口
+    else:
+        text = build_text(kind, body, a.no_prefix) if body else u""
     if text:
         # ★ kind 一起写进去：桌宠据此选卡片配色（干活=蓝 / 问答=青 / 闲聊=紫）
         atomic_write(NOTIFY, {"text": text, "ts": time.time(), "secs": a.secs,
@@ -597,7 +873,7 @@ def main():
             #   纯问答只发 `--work`（没有 `--reply` 的 done/settle），短 ttl 就是它**唯一**的
             #   收尾路径。带进度的档要么提前 return（`--reply`），要么不改这里的默认值。
             _ttl = a.ttl
-            if st == "working" and a.progress is None and abs(a.ttl - 2700.0) < 1e-6:
+            if st == "working" and a.progress is None and a.ttl is None:
                 _ttl = WORK_TTL_S
             atomic_write(STATE, {"state": st, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
                                  "ttl": _ttl, "note": text[:40]})

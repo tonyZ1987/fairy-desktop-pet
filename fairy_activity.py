@@ -130,6 +130,38 @@ SOFT = ("function_call_result", "message", "file-history-snapshot", None)
 MEANINGFUL = ("message", "function_call", "function_call_result", "reasoning")
 
 
+def _ev_ts(d):
+    u"""从一条事件里取**它的落盘时刻**（wall-clock 秒）；取不到 → None。
+
+    ★★ 2026-09-23 21:1x 新增（根治"被记账事件抢镜"）：
+      在这之前，"谁最新"一律看**文件 mtime**。而 harness 会往 jsonl 追加记账事件
+      （`file-history-snapshot`）—— **哪怕没人干活**也会把 mtime 推新。
+      实测：主人在 Fairy 窗口问一句话 ⇒ Fairy 的 jsonl mtime 变最新 ⇒ 感知认了 Fairy、
+      去读 Fairy 那份（`planned=False`）⇒ **工作态对、但进度条不显示**（主人 21:12 截图）。
+    ⇒ 改看**事件自带的 `timestamp`**：它只随**真实事件**推进，不受记账干扰。
+    ★ 兼容毫秒 / 秒 / ISO 字符串三种写法（实测见过 `1790168256096` 这种毫秒）。
+    """
+    v = d.get("timestamp")
+    if v is None:
+        v = d.get("ts")
+    if v is None:
+        v = d.get("time")
+    if isinstance(v, bool):          # bool 是 int 的子类，先挡掉
+        return None
+    if isinstance(v, (int, float)):
+        v = float(v)
+        return v / 1000.0 if v > 1e11 else v      # >1e11 ⇒ 是毫秒
+    if isinstance(v, str):
+        try:
+            return time.mktime(time.strptime(v[:19], u"%Y-%m-%dT%H:%M:%S"))
+        except Exception:
+            try:
+                return float(v)
+            except Exception:
+                return None
+    return None
+
+
 class ActivityWatch:
     def __init__(self, root=None, exit_=EXIT_S, scan=SCAN_S, hold=HOLD_S, only=None,
                  assist_hold=ASSIST_HOLD_S):
@@ -217,14 +249,40 @@ class ActivityWatch:
         return False
 
     def _newest(self, now):
-        u"""返回 (最新 jsonl 路径, 其 mtime)。★ 只扫白名单里的项目（见 `only`）。"""
+        u"""→ `(最新 jsonl 路径, 它的**末事件落盘时刻**)`。★ 只扫白名单里的项目。
+
+        ★★★ 2026-09-23 21:1x **根治**（主人 21:12 截图：「文成那边在动手，进度条也没出来」）：
+          原来**跨项目**比的是**文件 mtime**：
+
+              m = e.stat().st_mtime        # 谁的文件新就认谁
+              if m > best: best, best_p = m, e.path
+
+          而 harness 会往 jsonl 追加**记账事件**（`file-history-snapshot`）⇒ **没人干活也会推新 mtime**。
+          实测：主人在 Fairy 窗口问一句话 ⇒ Fairy 的 jsonl 变最新 ⇒
+
+              感知认了 Fairy  ⇒  `_read_progress()` 去读 `_prog/progress_e-AI成图实践-Fairy.json`
+                             ⇒  那份是 `0% + planned=False`（只打过招呼、还没拆任务）
+                             ⇒  `_bar_pct()` 见 `not prog_planned` ⇒ **返回 None ⇒ 进度条不显示**
+
+          ⇒ 现象就是「**工作态是对的，但条不出现**」，而且**只有文成一个项目在跑时也会发生**
+            （因为"抢镜"的是**另一个项目的记账写入**，与那个项目忙不忙无关）。
+
+        ⇒ 现在分两层，各用各的判据：
+          · **同一个项目内**：仍按文件 mtime 挑最新会话 —— 项目内不存在"被别的项目抢"的问题；
+          · **跨项目**：比较各自的**末事件时刻**（`MEANINGFUL` 过滤之后那条，见 `_ev_ts`）。
+            取不到时刻（= 文件里没有白名单事件，或读失败）⇒ **rank = 0，排到最后** ——
+            ★ **绝不能回退用 mtime**，否则"只有记账事件的项目"照样会赢，等于没修。
+        """
         self._refresh_dirs(now)
-        best, best_p = 0.0, ""
         self.skipped = 0
+        cand = []                     # [(用来比较的时刻, 该文件 mtime, 路径, 项目目录名)]
         for d in self._subdirs:
-            if not self._match(os.path.basename(d)):
+            pdir = os.path.basename(d)
+            if not self._match(pdir):
                 self.skipped += 1
                 continue                      # ★ 别的项目在动 ⇒ 与我无关，不看
+            # ① 同一项目内：按 mtime 挑最新的那个会话文件
+            best_m, best_p = 0.0, ""
             try:
                 with os.scandir(d) as it:
                     for e in it:
@@ -234,20 +292,39 @@ class ActivityWatch:
                             m = e.stat().st_mtime
                         except OSError:
                             continue
-                        if m > best:
-                            best, best_p = m, e.path
+                        if m > best_m:
+                            best_m, best_p = m, e.path
             except Exception:
                 continue
-        if best:
-            self.last_act = max(self.last_act, best)
-            self.last_file = os.path.basename(best_p)
-            # ★ 顺手记下"这个会话文件属于哪个项目"（见 `last_dir` 的说明）
-            self.last_dir = os.path.basename(os.path.dirname(best_p))
-        return best_p, best
+            if not best_p:
+                continue
+            # ② 取这个文件的"末事件时刻"（`MEANINGFUL` 过滤之后那条）
+            # ★★ 取不到 ⇒ **rank = 0（最低优先级）**，**不要回退用 mtime**！
+            #   我第一版写的是"回退用 mtime"——那等于**没根治**：
+            #   一个"只有记账事件、没人干活"的项目，它的 mtime 恰恰是最新的
+            #   ⇒ 回退过去它照样赢（正是要消灭的那个现象）。
+            #   "末事件取不到"只有两种成因：① 文件里**没有白名单事件**（= 真没干活）✓
+            #   ② 读失败（罕见，下一轮会重试）⇒ 两种情况都该让它**排后面**。
+            ev = self._tail_event(best_p)[3]
+            cand.append((ev or 0.0, best_m, best_p, pdir))
+        if not cand:
+            return "", 0.0
+        # ③ 跨项目：**谁的末事件更新就认谁**（不再看文件 mtime）
+        # ★★ 2026-09-24：把**每个项目各自的末事件时刻**存下来 ——
+        #   桌宠的"多项目排队"要用它判"那个项目还活着吗"（见 `_open_tasks`）。
+        #   ★ 数据本来就在手里（上面每个候选都读了尾部），只是以前丢了。
+        self.per_proj = {c[3]: c[0] for c in cand}
+        cand.sort(key=lambda x: x[0], reverse=True)
+        rank, mt, path, pdir = cand[0]
+        self.last_act = max(self.last_act, rank)
+        self.last_file = os.path.basename(path)
+        # ★ 顺手记下"这个会话文件属于哪个项目"（见 `last_dir` 的说明）
+        self.last_dir = pdir
+        return path, rank
 
     @staticmethod
     def _tail_event(path):
-        u"""读文件尾部 → `(末事件类型, role, 最近一条 message 的 role)`；失败 → 三个 None。
+        u"""读文件尾部 → `(末事件类型, role, 最近一条 message 的 role, 末事件时刻)`。
 
         ★★★ 2026-09-23 **真根因**（主人：「等了很久，看来这个 bug 你还是没修好」）：
           实测 `file-history-snapshot` 会**紧跟在主人那条 user 消息之后**写进来
@@ -258,6 +335,8 @@ class ActivityWatch:
         ⇒ 两条修法：
           ① 只认白名单 `MEANINGFUL` 里的类型，harness 记账类一律**跳过**；
           ② 顺手带回"最近一条 `message` 的 role" —— 用它判"他还在等我"（见 `active()`）。
+        ★ 2026-09-23 21:1x 加第 4 项：**末事件的落盘时刻**（`_ev_ts`）——
+          挑项目与算保持窗口都要用它，不能再用文件 mtime（见 `_newest` / `_ev_ts`）。
         """
         try:
             with open(path, "rb") as f:
@@ -267,7 +346,7 @@ class ActivityWatch:
                 f.seek(size - n)
                 data = f.read(n)
         except Exception:
-            return None, None, None
+            return None, None, None, None
         last_msg_role = None
         for raw in reversed(data.split(b"\n")):
             raw = raw.strip()
@@ -284,8 +363,9 @@ class ActivityWatch:
             if last_msg_role is None and t == "message":
                 last_msg_role = role          # ★ 尾部**最近一条** message 的角色
             if t in MEANINGFUL:
-                return t, role, last_msg_role
-        return None, None, last_msg_role
+                # ★ 只回**白名单那条**的时刻 —— 记账事件的时间不算数
+                return t, role, last_msg_role, _ev_ts(d)
+        return None, None, last_msg_role, None
 
     # ---------------------------------------------------------------- 对外
     def age(self, now=None):
@@ -302,12 +382,15 @@ class ActivityWatch:
             return False
         if now - self._scan_at >= self.scan:
             self._scan_at = now
-            path, mt = self._newest(now)
+            path, ev_at = self._newest(now)
             if path:
                 (self.last_type, self.last_role,
-                 self.last_msg_role) = self._tail_event(path)
+                 self.last_msg_role, _ev) = self._tail_event(path)
                 # ★ 记住"这条末事件是什么时候落盘的" —— 保持窗口必须用它来算（见下）
-                self._ev_at = mt
+                #   ★★ 2026-09-23 21:1x：`_newest` 返回的第二项已从**文件 mtime** 换成
+                #      **末事件时刻** ⇒ 这里不用改，但语义更准了：以前记账事件会把 mtime
+                #      推新、把保持窗口**错误延长**，现在不会了。
+                self._ev_at = ev_at
         age = self.age(now)
         t, r = self.last_type, self.last_role
 

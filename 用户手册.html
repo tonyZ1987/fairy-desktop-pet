@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fairy · 用户手册 v2.2</title>
+<style>
+  :root{
+    --fg:#1f2329; --fg2:#5c6570; --fg3:#8b939c;
+    --line:#e6e8eb; --bg:#ffffff; --bg2:#f7f8fa; --bg3:#f2f4f7;
+    --accent:#2b6cf6; --accent-bg:#eef3ff;
+    --code-bg:#f6f7f9; --warn:#b7791f; --warn-bg:#fff8e6;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--bg); color:var(--fg);
+    font:15px/1.75 -apple-system,"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  /* ---------- 左：导航 ---------- */
+  .side{
+    position:fixed; left:0; top:0; bottom:0; width:252px;
+    background:var(--bg2); border-right:1px solid var(--line);
+    padding:26px 0 18px; overflow:auto;
+  }
+  .brand{padding:0 22px 18px; border-bottom:1px solid var(--line); margin-bottom:14px}
+  .brand b{display:block; font-size:19px; letter-spacing:.3px}
+  .brand span{display:block; color:var(--fg3); font-size:12.5px; margin-top:3px}
+  .side nav a{
+    display:block; padding:9px 22px; color:var(--fg2); text-decoration:none;
+    font-size:14.5px; border-left:3px solid transparent;
+  }
+  .side nav a:hover{background:#eef0f3; color:var(--fg)}
+  .side nav a.on{color:var(--accent); background:var(--accent-bg); border-left-color:var(--accent); font-weight:600}
+  .side .foot{padding:16px 22px 0; color:var(--fg3); font-size:12px; border-top:1px solid var(--line); margin-top:16px}
+  /* ---------- 中：正文 ---------- */
+  main{margin:0 268px 0 252px; padding:40px 46px 96px; max-width:900px}
+  .page{display:none}
+  .page.on{display:block}
+  h1{font-size:27px; margin:0 0 6px; letter-spacing:.2px}
+  .lead{color:var(--fg2); margin:0 0 26px; font-size:15px}
+  h2{font-size:19px; margin:40px 0 12px; padding-top:6px}
+  h3{font-size:16px; margin:26px 0 8px}
+  h2:first-of-type{margin-top:22px}
+  p{margin:9px 0}
+  ul,ol{margin:9px 0; padding-left:22px}
+  li{margin:5px 0}
+  code{background:var(--code-bg); border:1px solid var(--line); border-radius:4px;
+       padding:1px 5px; font-size:13px; font-family:Consolas,"Courier New",monospace}
+  pre{background:var(--code-bg); border:1px solid var(--line); border-radius:8px;
+      padding:13px 15px; overflow:auto; font-size:13px; line-height:1.6;
+      font-family:Consolas,"Courier New",monospace}
+  pre code{background:none; border:0; padding:0}
+  table{width:100%; border-collapse:collapse; margin:12px 0; font-size:14.3px}
+  th,td{border:1px solid var(--line); padding:9px 12px; text-align:left; vertical-align:top}
+  th{background:var(--bg3); font-weight:600}
+  tr:nth-child(even) td{background:#fcfcfd}
+  img{max-width:100%; border-radius:10px; border:1px solid var(--line); margin:10px 0; display:block}
+  .two{display:flex; gap:14px; flex-wrap:wrap}
+  .two figure{margin:0; flex:1 1 300px}
+  .two figcaption{color:var(--fg3); font-size:12.5px; margin-top:-4px}
+  figure{margin:14px 0}
+  figcaption{color:var(--fg3); font-size:12.5px}
+  .note{border-left:3px solid var(--accent); background:var(--accent-bg);
+        padding:10px 14px; border-radius:0 8px 8px 0; margin:14px 0; font-size:14.3px}
+  .warn{border-left:3px solid var(--warn); background:var(--warn-bg);
+        padding:10px 14px; border-radius:0 8px 8px 0; margin:14px 0; font-size:14.3px}
+  .hero{border:1px solid var(--line); border-radius:12px; padding:16px 18px; background:var(--bg2); margin:0 0 22px}
+  .hero b{color:var(--accent)}
+  .steps{counter-reset:s; list-style:none; padding-left:0}
+  .steps li{counter-increment:s; position:relative; padding-left:34px; margin:12px 0}
+  .steps li::before{
+    content:counter(s); position:absolute; left:0; top:2px;
+    width:22px; height:22px; line-height:22px; text-align:center; border-radius:50%;
+    background:var(--accent); color:#fff; font-size:12.5px; font-weight:700;
+  }
+  /* 更新日志 */
+  .ver-row{display:flex; align-items:baseline; gap:10px; margin:30px 0 10px}
+  .ver-row .tag{font-size:17px; font-weight:700}
+  .ver-row .date{color:var(--fg3); font-size:13px}
+  .pill{display:inline-block; font-size:11.5px; padding:1px 8px; border-radius:10px;
+        background:var(--accent-bg); color:var(--accent); border:1px solid #d5e2ff; margin-left:6px}
+  .pill.gray{background:var(--bg3); color:var(--fg3); border-color:var(--line)}
+  hr{border:0; border-top:1px solid var(--line); margin:34px 0}
+  /* ---------- 右：快速导航 ---------- */
+  .toc{position:fixed; right:0; top:0; width:236px; bottom:0; padding:44px 20px; overflow:auto;
+       border-left:1px solid var(--line)}
+  .toc .t{color:var(--fg3); font-size:12.5px; margin-bottom:10px}
+  .toc a{display:block; color:var(--fg2); text-decoration:none; font-size:13px;
+         padding:3px 0 3px 9px; border-left:2px solid transparent; line-height:1.5}
+  .toc a:hover{color:var(--fg)}
+  .toc a.h2{padding-left:9px}
+  .toc a.h3{padding-left:22px; color:var(--fg3); font-size:12.5px}
+  .toc a.on{color:var(--accent); border-left-color:var(--accent)}
+  @media (max-width:1180px){.toc{display:none} main{margin-right:40px}}
+  @media (max-width:820px){.side{position:static; width:auto; border-right:0; border-bottom:1px solid var(--line)} main{margin:0; padding:26px 20px 70px}}
+</style>
+</head>
+<body>
+
+<aside class="side">
+  <div class="brand">
+    <b>Fairy</b>
+    <span>Windows 桌面宠物 · 用户手册</span>
+  </div>
+  <nav>
+    <a href="#use" class="on">使用说明</a>
+    <a href="#install">安装指南</a>
+    <a href="#features">功能说明</a>
+    <a href="#faq">常见问题</a>
+    <a href="#changelog">更新日志</a>
+    <a href="#credits">致谢与许可</a>
+  </nav>
+  <div class="foot">
+    版本 v2.2 · 2026-09-28<br>
+    Windows 10 / 11
+  </div>
+</aside>
+
+<main>
+
+<!-- ===================================================== 使用说明 -->
+<section class="page on" id="use">
+  <h1>使用说明</h1>
+  <p class="lead">一只待在桌面上的小挂件，只做一件事：<strong>让「我正在干活」一眼可见。</strong></p>
+
+  <div class="hero">
+    干活时，它<b>半睁着眼</b>，外圈辉光碎成一串 <b>0/1 的数字流</b>，下面挂一条<b>进度条</b>；
+    活干完了，它弹一张小卡片告诉你。你不需要盯着任何窗口 —— 抬头看一眼就够了。
+  </div>
+
+  <img src="fairy-desktop-pet/docs/images/STEP10_工作态四层.png" alt="工作态：半睁眼 + 辉光数字流 + 进度条">
+  <p style="color:var(--fg3);font-size:12.5px;margin-top:-4px">工作态：半睁眼、外圈数字流、下方进度条</p>
+
+  <h2>一、它什么时候会动</h2>
+  <p>它自己不会凭空忙起来 —— 只有「有人告诉它」或「感知到你那边的 AI 在动」才会切状态。</p>
+  <table>
+    <tr><th style="width:34%">情形</th><th>它的表现</th></tr>
+    <tr><td>刚启动</td><td><strong>常态</strong>（睁眼、安静）—— 上一轮的工作态不会被继承</td></tr>
+    <tr><td>有任务开始</td><td><strong>半睁眼</strong>（工作态），此时通常还没有进度条</td></tr>
+    <tr><td>任务拆好步骤、开始推进</td><td>半睁眼 + <strong>进度条</strong>，按最小 1% 的台阶往上爬</td></tr>
+    <tr><td>任务跑完</td><td>弹一张<strong>完成卡</strong>，进度条到 100% 后停一会儿再消失</td></tr>
+    <tr><td>你发的消息被接住了</td><td>立刻半睁、先不出进度条，<strong>一直保持到它把话说完</strong>（中间不闪）</td></tr>
+  </table>
+  <div class="note">
+    一句话：<strong>你一发消息它就半睁，一直到它把话说完。</strong>
+    任务还在跑的时候也不会「闪回」常态 —— 这是特意调过的。
+  </div>
+
+  <h2>二、怎么操作</h2>
+  <ul>
+    <li><strong>拖动</strong>：按住左键拖到任意位置，松手就停在那儿。</li>
+    <li><strong>双击</strong>：它会说一句话（不会弹窗、不抢焦点）。</li>
+    <li><strong>右键</strong>：打开菜单 —— 显示 / 行为 / 播放开机动画 / 归位 / 退出。</li>
+    <li><strong>找不到它了</strong>：右键菜单里点「归位（右下角）」，或者<strong>再双击一次启动器</strong>。</li>
+  </ul>
+  <img src="fairy-desktop-pet/docs/images/STEP12_菜单_滑块式.png" alt="右键菜单">
+  <p style="color:var(--fg3);font-size:12.5px;margin-top:-4px">右键菜单分两级：主菜单只放导航和动作，设置都收在二级页里</p>
+  <p>菜单里<strong>悬停 5 秒</strong>会浮出一行说明；不需要记。</p>
+
+  <h2>三、让它跟 AI 配合（推荐做一次）</h2>
+  <p>
+    它靠「别人告诉它」才知道你在干活。如果你电脑上跑着 <strong>WorkBuddy 这类 AI 工具</strong>，
+    可以让 AI 在每次接活时<strong>自动</strong>告诉它 —— 装一次，以后不用管。
+  </p>
+  <ol class="steps">
+    <li>在 Fairy 目录里双击 <code>install_agent_bridge.vbs</code>，弹出「装好了」即可。</li>
+    <li><strong>开一个新的 AI 任务</strong>（已经在跑的老任务要新开一次才会读到）。</li>
+    <li>之后 AI 每接一个活，它就会自动半睁、报进度、干完弹卡。</li>
+  </ol>
+  <div class="note">
+    不想用了：双击 <code>uninstall_agent_bridge.vbs</code>，配置会被摘干净。
+    <br>中途想临时静音（不改配置）：在 Fairy 目录里新建一个空文件 <code>fairy_bridge_off</code>。
+  </div>
+
+  <h2>四、不装桥接也能用（会敲命令行的话）</h2>
+  <p>四条命令就够：</p>
+  <pre><code>python fairy_notify.py --work "接单：改通知卡圆角"     :: 切工作态（先不出进度条）
+python fairy_notify.py --plan 3 "查现状/出候选/落地"   :: 拆好步骤 ⇒ 进度条登场
+python fairy_notify.py --item 1 2                      :: 第 1 项的第 2 小段完成
+python fairy_notify.py --reply "主人，3 项修改已完成。"   :: 跑到 100% + 弹完成卡</code></pre>
+  <p>不想敲命令的话，双击 <code>test_notify.vbs</code> 就能看到卡片效果。</p>
+
+  <h2>五、它怎么知道"你在干活"</h2>
+  <table>
+    <tr><th style="width:44%">你那边发生的事</th><th>它的反应</th></tr>
+    <tr><td>任务被拆成 N 步</td><td>进度条出现，从 0% 开始</td></tr>
+    <tr><td>某一步做完</td><td>进度条往前走一格（不会突然跳）</td></tr>
+    <tr><td>你点「停止 / 取消」</td><td>它立刻回常态，不占着进度条</td></tr>
+    <tr><td>同时开了好几个任务</td><td>进度条只跟<strong>最先开始</strong>的那个；它完了条就消失（不接棒给下一个）</td></tr>
+    <tr><td>任务卡住不动了</td><td>几分钟后它自己放手、回常态</td></tr>
+  </table>
+</section>
+
+<!-- ===================================================== 安装指南 -->
+<section class="page" id="install">
+  <h1>安装指南</h1>
+  <p class="lead">三步：装 Python → 解压 → 双击。之后每次开机只要双击一次（或让它自启）。</p>
+
+  <h2>一、环境</h2>
+  <table>
+    <tr><th style="width:30%">项目</th><th>要求</th></tr>
+    <tr><td>系统</td><td><strong>Windows 10 / 11</strong>（只有 Windows 版）</td></tr>
+    <tr><td>Python</td><td><strong>3.10 或更高</strong>，装的时候记得勾上 <code>Add python.exe to PATH</code></td></tr>
+    <tr><td>其它依赖</td><td>不需要额外装界面库（不需要 tkinter / Qt），<code>pip install -r requirements.txt</code> 即可</td></tr>
+  </table>
+  <div class="note">
+    官方安装包 + 勾选 <strong>Add python.exe to PATH</strong> ⇒ 放哪儿都能跑，不用做任何配置。
+    中文路径也可以。
+  </div>
+
+  <h2>二、装</h2>
+  <ol class="steps">
+    <li>把整个文件夹解压到任意位置（建议<strong>路径别太深</strong>）。</li>
+    <li>双击 <code>start_fairy.vbs</code> —— 它会自己在屏幕右下角出现。</li>
+    <li>第一次会慢，见下节。</li>
+  </ol>
+
+  <h2>三、第一次启动会慢一次，之后秒开</h2>
+  <table>
+    <tr><th style="width:26%">阶段</th><th>说明</th></tr>
+    <tr><td>① 倒计时小窗</td><td>第一次需要预生成图像缓存，屏幕正中会出现一块倒计时窗（常见档位约 <strong>100 秒</strong>）。<strong>窗口不出来也是正常的</strong>，别急着关。</td></tr>
+    <tr><td>② 开机动画</td><td>缓存好了播一遍开机动画 → 它在屏幕<strong>中央</strong>登场 → 自己走到<strong>右下角</strong>。</td></tr>
+    <tr><td>③ 以后每次</td><td>缓存命中 ⇒ <strong>约 0.2 秒秒开</strong>。</td></tr>
+  </table>
+  <p>想一次性把三档都生成好（约 5~6 分钟，之后换档也是秒开）：</p>
+  <pre><code>python fairy_bake.py 200 260 320</code></pre>
+  <p>
+    它<strong>启动时会自己测屏幕</strong>决定大小档位：小屏 200 / 全高清 260 / 2K 以上 320（只认主屏），
+    也可以在右键菜单里手动改。
+  </p>
+
+  <h2>四、找不到 Python？</h2>
+  <p>启动器不写死任何机器路径，会按顺序自己找：</p>
+  <pre><code>环境变量 FAIRY_PYTHON  →  同目录的 python_path.txt  →  常见安装目录  →  系统 PATH</code></pre>
+  <p>如果你用的是便携版 Python 或虚拟环境，就在目录里放一个 <code>python_path.txt</code>，写一行路径就行：</p>
+  <pre><code>D:\Python311\pythonw.exe</code></pre>
+
+  <h2>五、怀疑没起来？</h2>
+  <p>双击 <code>check_fairy.vbs</code> —— 它会弹窗直接告诉你结论（进程在不在、窗口可见不可见、最近有没有报错）。</p>
+  <table>
+    <tr><th style="width:32%">文件</th><th>什么时候用</th></tr>
+    <tr><td><code>start_fairy.vbs</code></td><td>启动</td></tr>
+    <tr><td><code>restart_fairy.vbs</code></td><td>改过设置/换过档位后重启（先关旧的再起新的）</td></tr>
+    <tr><td><code>check_fairy.vbs</code></td><td>怀疑没起来、或者行为不对时的体检</td></tr>
+    <tr><td><code>install_agent_bridge.vbs</code></td><td>让 AI 自动配合（可选，装一次）</td></tr>
+    <tr><td><code>uninstall_agent_bridge.vbs</code></td><td>撤销上一条</td></tr>
+  </table>
+
+  <h2>六、卸载</h2>
+  <ul>
+    <li>右键菜单 → <strong>退出 Fairy</strong>；如果装过桥接，再双击 <code>uninstall_agent_bridge.vbs</code>。</li>
+    <li>最后把整个文件夹删掉即可 —— 它不写注册表、不装服务、不在系统目录留东西。</li>
+    <li>运行时生成的几个小文件（缓存、心跳、日志）都在它自己的目录里，一起删掉就行。</li>
+  </ul>
+</section>
+
+<!-- ===================================================== 功能说明 -->
+<section class="page" id="features">
+  <h1>功能说明</h1>
+  <p class="lead">按「你会看到什么」来写，不按代码结构写。</p>
+
+  <h2>一、眼睛与状态</h2>
+  <table>
+    <tr><th style="width:22%">状态</th><th>长什么样</th><th style="width:30%">什么时候</th></tr>
+    <tr><td>常态</td><td>睁眼，外圈是缓慢游走的辉光</td><td>闲着</td></tr>
+    <tr><td>工作态</td><td><strong>半睁眼</strong>，外圈辉光碎成 0/1 的数字流</td><td>有人报了「开始干活」，或感知到 AI 在动</td></tr>
+    <tr><td>有进度</td><td>工作态 + 下方一条进度条</td><td>任务被拆成步骤后</td></tr>
+    <tr><td>完成</td><td>弹一张小卡片</td><td>任务交付</td></tr>
+    <tr><td>刚开机</td><td>播一遍开机动画 + 一句问候</td><td>启动时（可在菜单里关掉）</td></tr>
+  </table>
+
+  <h2>二、进度条</h2>
+  <ul>
+    <li>只显示「<strong>当前这一个任务</strong>」的进度，百分比按最小 1% 台阶往上爬，不会突然跳。</li>
+    <li>条上写着<strong>是哪个项目</strong>（比如任务名或项目短名），一眼知道这条在跟谁。</li>
+    <li>如果数字前面出现 <code>≈</code>，意思是<strong>这个数有点旧了</strong>（那边有一会儿没更新）——
+      「至少这么多，可能更多」，不是出错。</li>
+    <li>任务完成或取消后，进度条会<strong>自己消失</strong>，不会赖在屏幕上。</li>
+  </ul>
+
+  <h2>三、通知卡</h2>
+  <img src="fairy-desktop-pet/docs/images/STEP13_任务完成通知.png" alt="完成通知卡">
+  <p style="color:var(--fg3);font-size:12.5px;margin-top:-4px">任务完成时弹的小卡片</p>
+  <ul>
+    <li>卡片是<strong>纯文字</strong>，自动折行，最多 3 行。</li>
+    <li><strong>读完即删</strong>：看过一次就不再弹，不会堆在屏幕上。</li>
+    <li>完成卡的句式是固定的：<code>主人，"XXX"工作空间的项目已完成N项修改，请前往查阅。</code></li>
+  </ul>
+
+  <h2>四、菜单里能改什么</h2>
+  <table>
+    <tr><th style="width:26%">分组</th><th>项</th></tr>
+    <tr><td><strong>显示 ▸</strong></td><td>尺寸（小 200 / 中 260 / 大 320）、字体（中 / 粗 / 特粗）</td></tr>
+    <tr><td><strong>行为 ▸</strong></td><td>模式（自动 / 手动）、来源、感知、状态、置顶、开机</td></tr>
+    <tr><td>动作</td><td>播放开机动画、归位（右下角）、退出 Fairy</td></tr>
+  </table>
+  <div class="warn">
+    「行为 ▸ 开机」里<strong>改完要重启一次</strong>才生效；菜单里<strong>悬停 5 秒</strong>会有一行说明。
+  </div>
+
+  <h2>五、不碰鼠标的开关</h2>
+  <p>在 Fairy 目录里放一个文件就行（适合写脚本或做自动化）：</p>
+  <table>
+    <tr><th style="width:24%">文件</th><th>作用</th></tr>
+    <tr><td><code>stop.txt</code></td><td>让它自己退出（并删掉这个文件）</td></tr>
+    <tr><td><code>poke.txt</code></td><td>让它归位并亮出来（再双击一次启动器也是这个效果）</td></tr>
+  </table>
+
+  <h2>六、隐私与开销</h2>
+  <ul>
+    <li><strong>不联网</strong>：它没有任何对外请求，不需要账号，不需要权限。</li>
+    <li><strong>不读你的文件</strong>：它只在自己目录里读几个纯文本小文件（状态、进度、通知）。</li>
+    <li><strong>开销</strong>：平时很轻；高分屏（系统缩放 ≠ 100%）下图像缓存会按缩放变大，第一次生成也更久。</li>
+  </ul>
+</section>
+
+<!-- ===================================================== 常见问题 -->
+<section class="page" id="faq">
+  <h1>常见问题</h1>
+
+  <h3>双击了没反应？</h3>
+  <p>双击 <code>check_fairy.vbs</code>，它会告诉你卡在哪一步（多数是没找到 Python，按「安装指南 · 四」放一个 <code>python_path.txt</code> 即可）。</p>
+
+  <h3>它一直半睁着，是不是坏了？</h3>
+  <p>不是。半睁 = 有任务还没结束。想让它回去：<strong>等几分钟</strong>它会自己放手；或者让 AI 把那个任务收尾。</p>
+
+  <h3>进度条一直不动 / 一直 0%？</h3>
+  <p>进度是「别人报给它」的，没人报就不会动。装过 <code>install_agent_bridge.vbs</code> 的话，
+  开一个<strong>新的</strong> AI 任务就会正常上报。</p>
+
+  <h3>第一次启动为什么要等那么久？</h3>
+  <p>第一次要把动效预生成成缓存（常见档位约 100 秒），之后每次 0.2 秒开。想更快可以先用
+  <code>python fairy_bake.py 200 260 320</code> 把三档一次生成好。</p>
+
+  <h3>能放到副屏吗？</h3>
+  <p>目前只落在<strong>主屏</strong>，也不会压到任务栏上。移动范围限制在主屏内。</p>
+
+  <h3>能改「主人」这个称呼吗？</h3>
+  <p>可以，改程序里的文案字符串即可（界面上没有做开关）。</p>
+
+  <h3>它会不会联网 / 上传东西？</h3>
+  <p>不会。它没有任何网络请求，也不读你的文档。</p>
+
+  <h3>想让 AI 的进度汇报更细？</h3>
+  <p>那是 AI 那边的事：把任务拆得更细、每完成一小步就报一次，进度条就会更平滑。</p>
+</section>
+
+<!-- ===================================================== 更新日志 -->
+<section class="page" id="changelog">
+  <h1>更新日志</h1>
+  <p class="lead">倒序排列，最新的在最上面。</p>
+
+  <div class="ver-row"><span class="tag">v2.2</span><span class="date">2026-09-28</span><span class="pill">最新</span></div>
+  <ul>
+    <li><strong>一键让 AI 配合</strong>：双击 <code>install_agent_bridge.vbs</code>，之后 AI 每接一个活都会自动上报（不用改任何配置、不用重启）。</li>
+    <li><strong>多任务不再打架</strong>：同时开几个任务时，进度条只跟最先开始的那个；它交付后条消失，<strong>不接棒</strong>给下一个；只要还有任务没结束就一直是工作态。</li>
+    <li><strong>取消任务立刻回常态</strong>：你点「停止」之后，它不会再挂着进度条空等。</li>
+    <li><strong>进度条上显示项目名</strong>：一眼看出这条进度在跟哪个项目。</li>
+    <li><strong>数字陈旧提示</strong>：那边一会儿没更新，百分比前面会出现 <code>≈</code> 并变淡，表示「这个数有点旧」。</li>
+    <li><strong>完成卡句式统一</strong>：<code>主人，"XXX"工作空间的项目已完成N项修改，请前往查阅。</code></li>
+    <li><strong>开机问候</strong>：启动时按时间打招呼（早上好 / 中午好 / 下午好 / 晚上好 / 夜深了）。</li>
+    <li>其它：耐心度调整（不轻易从工作态闪回常态）、若干稳定性修复。</li>
+  </ul>
+
+  <div class="ver-row"><span class="tag">v2.1</span><span class="date">2026-09-23</span></div>
+  <ul>
+    <li><strong>会话活动感知</strong>：你在 AI 那边发一条消息，它就半睁；哪怕对方几分钟不吭声，它也保持 —— 中间不闪、不提前睁眼。</li>
+    <li>修掉「换个项目就顶着上一次的满条」的问题，以及两个会话互相踩的情况。</li>
+  </ul>
+
+  <div class="ver-row"><span class="tag">v2.0</span><span class="date">2026-09-23</span></div>
+  <ul>
+    <li><strong>首个公开发布版</strong>：60 fps 实时渲染（不再是逐帧播放图片）。</li>
+    <li>常态 / 工作态两套形态：工作态半睁眼 + 外圈 0/1 数字流。</li>
+    <li>进度条、通知卡、两级右键菜单、三档尺寸与字体。</li>
+    <li>启动自动测屏定档、开机动画、超时兜底（防止状态卡住）。</li>
+  </ul>
+
+  <hr>
+  <p style="color:var(--fg3);font-size:13px">
+    更早的版本是形象重建与动效量测阶段（对照官方源码逐项复刻），未单独发版。
+  </p>
+</section>
+
+<!-- ===================================================== 致谢与许可 -->
+<section class="page" id="credits">
+  <h1>致谢与许可</h1>
+
+  <h2>致谢</h2>
+  <p>这只桌宠能成立，靠的是几位创作者公开分享的东西 —— 请一并尊重他们的劳动：</p>
+  <ul>
+    <li><strong>米游社 @沝珵</strong> —— 提供了 Fairy 的 <strong>GIF 原图</strong>。形象对照、动效量测、外圈辉光的形状与配色，全部是从它量出来的。</li>
+    <li><strong>B站 @橙汁本色</strong> —— 开源了官方 mascot 的 <strong>SVG / JS 源码</strong>。本项目的形象是严格按它的几何逐项重建的，这是「像」的根本原因。</li>
+    <li><strong>B站 @玉偶青衣</strong> —— 提供了<strong>开机动画素材</strong>。</li>
+  </ul>
+  <p>也感谢《绝区零》与 miHoYo 创造了这个角色。</p>
+
+  <h2>许可</h2>
+  <table>
+    <tr><th style="width:26%">对象</th><th>说明</th></tr>
+    <tr><td>本项目代码</td><td><strong>Apache License 2.0</strong></td></tr>
+    <tr><td>角色与形象</td><td>版权归 <strong>miHoYo（米哈游）</strong> 所有；<strong>仅供个人学习与技术交流，请勿商用</strong></td></tr>
+    <tr><td>字体</td><td>思源黑体（OFL 1.1），随包分发</td></tr>
+  </table>
+  <div class="warn">
+    <strong>非官方项目</strong>，与米哈游无任何关联。详细的来源与归属声明见仓库里的 <code>NOTICE.md</code>。
+  </div>
+</section>
+
+</main>
+
+<aside class="toc">
+  <div class="t">快速导航</div>
+  <div id="tocList"></div>
+</aside>
+
+<script>
+(function(){
+  var pages = [].slice.call(document.querySelectorAll('.page'));
+  var links = [].slice.call(document.querySelectorAll('.side nav a'));
+  var tocList = document.getElementById('tocList');
+
+  function buildToc(page){
+    tocList.innerHTML = '';
+    if(!page) return;
+    var hs = [].slice.call(page.querySelectorAll('h2,h3'));
+    hs.forEach(function(h, i){
+      if(!h.id) h.id = page.id + '-h' + i;
+      var a = document.createElement('a');
+      a.href = '#' + h.id;
+      a.textContent = h.textContent;
+      a.className = (h.tagName === 'H2' ? 'h2' : 'h3');
+      a.dataset.target = h.id;
+      tocList.appendChild(a);
+    });
+    spy();
+  }
+
+  function spy(){
+    var as = [].slice.call(tocList.querySelectorAll('a'));
+    if(!as.length) return;
+    var cur = as[0];
+    as.forEach(function(a){
+      var el = document.getElementById(a.dataset.target);
+      if(el && el.getBoundingClientRect().top <= 130) cur = a;
+    });
+    as.forEach(function(a){ a.classList.toggle('on', a === cur); });
+  }
+
+  function show(id){
+    var target = null;
+    pages.forEach(function(p){
+      var on = ('#' + p.id) === id;
+      p.classList.toggle('on', on);
+      if(on) target = p;
+    });
+    if(!target) return;
+    links.forEach(function(a){ a.classList.toggle('on', a.getAttribute('href') === id); });
+    buildToc(target);
+    window.scrollTo(0, 0);
+  }
+
+  links.forEach(function(a){
+    a.addEventListener('click', function(e){
+      e.preventDefault();
+      var id = a.getAttribute('href');
+      history.replaceState(null, '', id);
+      show(id);
+    });
+  });
+
+  window.addEventListener('scroll', spy, {passive:true});
+
+  show(location.hash || '#use');
+})();
+</script>
+</body>
+</html>
