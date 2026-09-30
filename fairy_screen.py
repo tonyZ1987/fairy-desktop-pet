@@ -28,6 +28,7 @@ import ctypes
 import ctypes.wintypes as wintypes
 import json
 import sys
+import time
 
 user32 = ctypes.windll.user32
 
@@ -74,42 +75,77 @@ class _RECT(ctypes.Structure):
                 ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
 
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
 class _MONITORINFO(ctypes.Structure):
     _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", _RECT),
                 ("rcWork", _RECT), ("dwFlags", wintypes.DWORD)]
 
 
 MONITORINFOF_PRIMARY = 0x00000001
+#   `MonitorFromPoint` 的"给我离这个点最近的那块屏"（屏外/缝隙里的点也能拿回一块）。
+MONITOR_DEFAULTTONEAREST = 0x00000002
+#   `monitors()` 的结果缓存多久 —— 拖动是 60 fps，没必要每帧枚举一遍显示器。
+MON_CACHE_S = 1.0
+#   最近一次枚举显示器时吃到的异常（正常时是空表）。
+#   ★ 只记不写：桌宠跑在 pythonw 下 `sys.stderr` 是 `None`，写它会当场崩（铁律）
+#     ⇒ 由调用方（`report()` / `fairy_pet`）负责呈现，**绝不静默吞掉**。
+_ENUM_ERR = []
+_CACHE = {"t": 0.0, "mons": []}
 _MONITORENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
                                       ctypes.POINTER(_RECT), ctypes.c_double)
 
 
-def monitors():
-    u"""→ `[{left, top, right, bottom, w, h, primary}, ...]`（按系统枚举顺序）。
+def monitors(refresh=False):
+    u"""→ `[{hmon, left, top, right, bottom, w, h, work, primary}, ...]`（按枚举顺序）。
 
-    ★ 枚举失败（极罕见）就退化成"一块主屏"，绝不抛异常 —— 启动流程不能被它挡住。
+    ★★ 2026-09-28 **多屏化**（主人："希望主副桌面都能去，甚至 3 屏 4 屏都可以去，
+       但是不要挡到状态栏"）。每个元素比原来多两样：
+         · `hmon`：这块屏的句柄 —— `MonitorFromPoint()` 拿回来的就是它，用来"认屏"；
+         · `work`：`(l, t, r, b)` —— **这块屏自己的工作区**，已躲开**它自己那块屏上**的任务栏。
+           以前只有 `SPI_GETWORKAREA`，而它**永远只给主屏** ⇒ 根本没办"按屏取"。
+    ★ 结果**缓存 `MON_CACHE_S` 秒**（`refresh=True` 强制重查）：拖动是 60 fps，
+      每帧枚举一遍显示器没必要；插拔显示器 1 秒内被发现也够用。
+      ★ 返回的是**缓存里的同一份 list/dict** ⇒ 调用方**只读**，别就地改。
+    ★ 枚举失败（极罕见）退化成"一块主屏"，但**把原因记进 `_ENUM_ERR`**（不静默）——
+      启动流程不能被它挡住，可"失败了却什么都不说"就是下次要花几轮查的坑。
     """
+    now = time.time()
+    if not refresh and _CACHE["mons"] and (now - _CACHE["t"]) < MON_CACHE_S:
+        return _CACHE["mons"]
+    del _ENUM_ERR[:]
     out = []
 
     def cb(hmon, hdc, lprc, data):
-        mi = _MONITORINFO()
-        mi.cbSize = ctypes.sizeof(_MONITORINFO)
-        if user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
-            r = mi.rcMonitor
-            out.append({"left": r.left, "top": r.top, "right": r.right,
-                        "bottom": r.bottom, "w": r.right - r.left,
-                        "h": r.bottom - r.top,
-                        "primary": bool(mi.dwFlags & MONITORINFOF_PRIMARY)})
+        try:                       # ★ 回调里**绝不能**抛出去（ctypes 会静默吞掉）
+            mi = _MONITORINFO()
+            mi.cbSize = ctypes.sizeof(_MONITORINFO)
+            if user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                r, wk = mi.rcMonitor, mi.rcWork
+                out.append({"hmon": int(hmon),
+                            "left": r.left, "top": r.top,
+                            "right": r.right, "bottom": r.bottom,
+                            "w": r.right - r.left, "h": r.bottom - r.top,
+                            "work": (wk.left, wk.top, wk.right, wk.bottom),
+                            "primary": bool(mi.dwFlags & MONITORINFOF_PRIMARY)})
+            else:
+                _ENUM_ERR.append(u"GetMonitorInfoW(hmon=%s) 返回 0" % hmon)
+        except Exception as e:
+            _ENUM_ERR.append(repr(e))
         return 1
 
     try:
         user32.EnumDisplayMonitors(0, None, _MONITORENUMPROC(cb), 0)
-    except Exception:
-        pass
+    except Exception as e:
+        _ENUM_ERR.append(repr(e))
     if not out:
         w, h = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
-        out = [{"left": 0, "top": 0, "right": w, "bottom": h, "w": w, "h": h,
-                "primary": True}]
+        if not _ENUM_ERR:
+            _ENUM_ERR.append(u"EnumDisplayMonitors 一块屏都没返回")
+        out = [{"hmon": 0, "left": 0, "top": 0, "right": w, "bottom": h,
+                "w": w, "h": h, "work": (0, 0, w, h), "primary": True}]
     # ★ 系统没标主屏时（少见）把"包含原点"的那块当主屏
     if not any(m["primary"] for m in out):
         for m in out:
@@ -118,6 +154,10 @@ def monitors():
                 break
         else:
             out[0]["primary"] = True
+    for m in out:                  # 兜底：任何记录都必须有 work（正常路径不会走到）
+        if "work" not in m:
+            m["work"] = (m["left"], m["top"], m["right"], m["bottom"])
+    _CACHE["t"], _CACHE["mons"] = time.time(), out
     return out
 
 
@@ -138,7 +178,8 @@ def virtual():
 def work_area():
     u"""→ (l, t, r, b)：**主屏**工作区（已躲开任务栏）。
 
-    ★ `SPI_GETWORKAREA` 拿到的**永远**是主屏工作区 —— 这正是"默认落在主屏"想要的行为。
+    ★ `SPI_GETWORKAREA` 拿到的**永远**是主屏工作区 —— 这正是"归位/开机落在主屏"想要的。
+    ★★ 要"窗口所在那块屏"的工作区 ⇒ 用 `work_area_at(x, y)`（2026-09-28 新增）。
     """
     r = _RECT()
     try:
@@ -148,6 +189,88 @@ def work_area():
         pass
     p = primary()
     return p["left"], p["top"], p["right"], p["bottom"]
+
+
+def monitor_at(x, y, mons=None):
+    u"""→ **包含点 (x,y) 的那块屏**（点在所有屏之外/缝隙里 ⇒ 最近的那块）。
+
+    ★★ 判据用 `MonitorFromPoint(…, MONITOR_DEFAULTTONEAREST)` —— 2026-09-28 实测：
+      ① 每块屏**自己的中心点**都能稳定拿回自己（2/2 通过）；
+      ② 屏外与缝隙里的点回最近屏（跨屏拖动正需要这个）。
+    ★ 拿不到时两级退路（按矩形包含 → 按中心距离最近），**绝不抛异常**（每帧都会被调）。
+    """
+    mons = mons if mons is not None else monitors()
+    try:
+        h = int(user32.MonitorFromPoint(_POINT(int(x), int(y)),
+                                        MONITOR_DEFAULTTONEAREST))
+        for m in mons:
+            if m.get("hmon") == h:
+                return m
+    except Exception:
+        pass
+    for m in mons:                     # 退路①：点落在哪块屏的矩形里
+        if m["left"] <= x < m["right"] and m["top"] <= y < m["bottom"]:
+            return m
+    best, best_d = mons[0], None       # 退路②：中心距离最近的那块
+    for m in mons:
+        cx = (m["left"] + m["right"]) / 2.0
+        cy = (m["top"] + m["bottom"]) / 2.0
+        d = (cx - x) ** 2 + (cy - y) ** 2
+        if best_d is None or d < best_d:
+            best, best_d = m, d
+    return best
+
+
+def work_area_at(x, y):
+    u"""→ (l, t, r, b)：**点 (x,y) 所在那块屏**的工作区（那块屏的任务栏已躲开）。
+
+    ★★ 这是"桌宠能去任何一块屏、但不压那块屏的任务栏"的**唯一真源**：
+      Windows 给每块屏都单独算了 `rcWork`。2026-09-28 实测（1920+1920、任务栏都在底部）：
+        主屏 rcWork (0,0)-(1920,1040) ｜ 副屏 rcWork (1920,-9)-(3840,1031)
+      ⇒ 两屏都各自躲开了自己那条 40 px 的任务栏。
+    """
+    m = monitor_at(x, y)
+    return tuple(m["work"])
+
+
+def taskbar_bands(m):
+    u"""→ 这块屏上"被任务栏占掉"的矩形列表（`rcMonitor` 减去 `rcWork`），每条 `(l,t,r,b)`。
+
+    任务栏在底/顶/左/右都能覆盖；**没有任务栏的屏返回空表**（`rcWork == rcMonitor`）
+    ⇒ 拖动时自然不会被推。
+    ★ 上/下带与左/右带会**重叠**（左/右带铺满整高）—— 只用来判相交，重叠无害。
+    """
+    ml, mt, mr, mb = m["left"], m["top"], m["right"], m["bottom"]
+    wl, wt, wr, wb = m["work"]
+    out = []
+    if wt > mt:
+        out.append((ml, mt, mr, wt))
+    if wb < mb:
+        out.append((ml, wb, mr, mb))
+    if wl > ml:
+        out.append((ml, mt, wl, mb))
+    if wr < mr:
+        out.append((wr, mt, mr, mb))
+    return out
+
+
+def all_taskbar_bands(mons=None):
+    u"""→ **所有屏**的任务栏带（`taskbar_bands` 的合集）—— 拖动时一次判完。"""
+    mons = mons if mons is not None else monitors()
+    out = []
+    for m in mons:
+        out.extend(taskbar_bands(m))
+    return out
+
+
+def primary_anchor():
+    u"""→ 主屏中心点 `(x, y)`。
+
+    凡是"必须落在主屏"的场合（**归位 / 开机落点 / 开机动画居中**）都拿它当锚点 ——
+    这样 `fit()` 认屏时会认回主屏，而不是"窗口现在在哪块屏"。
+    """
+    p = primary()
+    return ((p["left"] + p["right"]) // 2, (p["top"] + p["bottom"]) // 2)
 
 
 # ---------------------------------------------------------------- 定档
@@ -195,13 +318,16 @@ def home(win_px, pet_px, margin_x=HOME_MARGIN_X, margin_y=HOME_MARGIN_Y):
     """
     l, t, r, b = work_area()
     off = (win_px - pet_px) // 2
+    # ★★ 2026-09-28 主人拍板：「**归位和开机全都默认在主屏幕右下**」
+    #   ⇒ 锚点**显式**给主屏中心（不给的话 `fit()` 会认成"窗口现在在哪块屏"，
+    #     于是人在副屏点归位、它就留在副屏 —— 与主人要的不符）。
     return fit(int(r - off - pet_px - margin_x),
                int(b - win_px + content_inset_b(win_px) - margin_y),
-               win_px, use_work=True)
+               win_px, use_work=True, anchor=primary_anchor())
 
 
-def fit(x, y, win_px, inset=None, pad=None, use_work=True, inset_b=None):
-    u"""把窗口左上角夹进**屏内**，保证**可见内容不越界** → `(x, y)`。
+def fit(x, y, win_px, inset=None, pad=None, use_work=True, inset_b=None, anchor=None):
+    u"""把窗口左上角夹进**它所在那块屏**，保证**可见内容不越界** → `(x, y)`。
 
     ★★ 为什么需要 `inset`（主人 2026-09-23 抓到的"往右下角移动后超出屏幕边界、
       通知框出屏"）：画布比本体每边大一圈（辉光余量），而**通知卡/进度条画在画布里、
@@ -211,10 +337,14 @@ def fit(x, y, win_px, inset=None, pad=None, use_work=True, inset_b=None):
         卡片始终留在屏内（`pad` 再多让 2 px，别让描边正好贴在最外一列像素上）。
     ★★ 纵向**另算**（`inset_b`）：卡片/条是贴画布**底**画的（见 `CONTENT_BOTTOM_F`），
       底边留白比左右小得多 ⇒ `y ≤ b − win + inset_b − pad`。
-    ★ `use_work=True`（**默认**）：夹进**主屏工作区** —— 连任务栏一起躲开
-      （主人 2026-09-23：「默认位置整体避开状态栏」）。
-      `False`：夹进**主屏整屏**（允许压任务栏，只在需要"能拖到最下面"时用）。
-    ★ 主人要求「位置**按一块屏**定位」⇒ 这里**只认主屏**，不碰虚拟桌面（副屏不外扩）。
+    ★★ 2026-09-28 **按屏夹**（多屏化）：`anchor`（默认 = **窗口中心**）经 `monitor_at()`
+      认屏，然后夹进**那块屏**的矩形 —— `use_work=True`（默认）⇒ 它的**工作区**，
+      连**它自己那条**任务栏一起躲开。
+      ⇒ "桌宠能去主屏 / 副屏 / 3 屏 / 4 屏，且在哪块屏上都不压那块屏的任务栏"。
+      ★ 要"**必须落在主屏**"的场合（**归位 / 开机落点 / 开机动画**），传
+        `anchor=primary_anchor()`；否则就会认成"窗口现在在哪块屏"。
+      ★ 拖动**过程中**别用它 ⇒ 用 `fit_drag()`（用它会撞上"两屏交界的墙"，见那边说明）。
+    ★ `use_work=False`：夹进**该屏整屏**（允许压任务栏，只在需要"能拖到最下面"时用）。
     """
     if inset is None:
         inset = CARD_INSET
@@ -222,11 +352,12 @@ def fit(x, y, win_px, inset=None, pad=None, use_work=True, inset_b=None):
         pad = EDGE_PAD
     if inset_b is None:
         inset_b = content_inset_b(win_px)
+    ax, ay = anchor if anchor else (int(x) + win_px // 2, int(y) + win_px // 2)
+    m = monitor_at(ax, ay)
     if use_work:
-        l, t, r, b = work_area()
+        l, t, r, b = m["work"]
     else:
-        p = primary()
-        l, t, r, b = p["left"], p["top"], p["right"], p["bottom"]
+        l, t, r, b = m["left"], m["top"], m["right"], m["bottom"]
     lo_x, hi_x = l - inset + pad, r - win_px + inset - pad
     lo_y, hi_y = t - inset + pad, b - win_px + inset_b - pad
     if hi_x < lo_x:                       # 窗口比屏幕还宽 ⇒ 居中（别把它推到屏外）
@@ -234,6 +365,51 @@ def fit(x, y, win_px, inset=None, pad=None, use_work=True, inset_b=None):
     if hi_y < lo_y:
         lo_y = hi_y = (t + b - win_px) // 2
     return int(max(lo_x, min(x, hi_x))), int(max(lo_y, min(y, hi_y)))
+
+
+def fit_drag(x, y, win_px, inset=None, pad=None, inset_b=None):
+    u"""**拖动中**（过渡态）：宽松 —— 夹进整个虚拟桌面，再只把"压到任务栏"推开。
+
+    ★★ 为什么不能直接用 `fit()`（2026-09-28 实测账 —— ★ 结论被自己的验证脚本修正过一次）：
+      `fit()` 的锚点取的是"**请求坐标**"（你想放到哪），请求越过屏边界后它会切屏
+      ⇒ **它其实跨得过去**。但中间有一段"**鼠标在动、窗口不动**"的死区，出死区再**瞬移**：
+        主屏往右的夹取上限 = `1920 − 370 + 16 − 2 = 1564`，
+        而锚点要等请求 `x ≥ 1735` 才切到副屏
+        ⇒ **死区 171 px**（主屏 200 档 128 px），随后从 1564 **瞬移**到 1906（跳 342 px）。
+      ⇒ 要"贴着鼠标走"就必须用它：拖动过程中**不按单屏工作区夹**。
+    ★ 代价：拖动中可以停在"两屏之间的缝隙/空白"上 —— 松手时上层会用 `fit()` 吸回最近屏。
+    ★ 但**任务栏照样躲**：可见内容一旦压到任何一块屏的任务栏带，就整体推开
+      （优先往上推 —— 任务栏在底部时最自然；推不动才往下推）。
+    """
+    if inset is None:
+        inset = CARD_INSET
+    if pad is None:
+        pad = EDGE_PAD
+    if inset_b is None:
+        inset_b = content_inset_b(win_px)
+    l, t, r, b = virtual()
+    x = int(max(l, min(int(x), r - win_px)))
+    y = int(max(t, min(int(y), b - win_px)))
+    for _round in range(4):                    # 多块屏可能叠着推 ⇒ 迭代几轮
+        bands = all_taskbar_bands()
+        if not bands:
+            break
+        cx0, cy0 = x + inset, y + inset                        # 可见内容左上
+        cx1, cy1 = x + win_px - inset, y + win_px - inset_b    # 可见内容右下
+        up = down = 0
+        for (bl, bt_, br, bb) in bands:
+            if cx1 <= bl or cx0 >= br or cy1 <= bt_ or cy0 >= bb:
+                continue                       # 与这条带不相交
+            up = max(up, cy1 - bt_)            # 往上推：内容底边挪到带顶之上
+            down = max(down, bb - cy0)         # 往下推：内容顶边挪到带底之下
+        if up <= 0 and down <= 0:
+            break
+        ny = y - up if (up and (not down or up <= down)) else y + down
+        ny = int(max(t, min(ny, b - win_px)))
+        if ny == y:
+            break                              # 推不动了（屏太小）⇒ 别死循环
+        y = ny
+    return x, y
 
 
 def clamp(x, y, win_px, to_virtual=True):
@@ -259,16 +435,22 @@ def on_primary(x, y, win_px):
 # ---------------------------------------------------------------- 报告
 def report(pet=None, win=None):
     u"""人读的体检报告（启动时也会写进日志）。"""
-    mons = monitors()
+    mons = monitors(refresh=True)
     p = primary()
     l, t, r, b = work_area()
     size, why = pick_size()
     lines = []
     lines.append(u"■ 显示器：共 %d 块" % len(mons))
     for i, m in enumerate(mons, 1):
+        wl, wt, wr, wb = m["work"]
         lines.append(u"   %d) %dx%d @(%d,%d) ~ (%d,%d)%s"
                      % (i, m["w"], m["h"], m["left"], m["top"], m["right"],
                         m["bottom"], u"  ← 主屏" if m["primary"] else u""))
+        lines.append(u"      它自己的工作区 %dx%d @(%d,%d) ｜ 任务栏占 %d 条"
+                     % (wr - wl, wb - wt, wl, wt, len(taskbar_bands(m))))
+    if _ENUM_ERR:                       # ★ 绝不静默：退化到单屏时必须留下痕迹
+        lines.append(u"[!] 枚举显示器时报了错（可能已退化成单屏）：%s"
+                     % u" / ".join(_ENUM_ERR[:3]))
     lines.append(u"■ 主屏：%dx%d ｜ 工作区 %dx%d @(%d,%d)（任务栏已躲开）"
                  % (p["w"], p["h"], r - l, b - t, l, t))
     lines.append(u"■ 定档：%s ⇒ **默认 %d px**" % (why, size))

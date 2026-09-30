@@ -170,6 +170,55 @@ def geom(S, cap_h=0):
 _CAP = {}
 
 
+def _fonts_for(txt):
+    u"""★ 2026-09-30（主人拍板）：按**内容**选字体。
+
+    `FONT_SMALL` 是**纯西文字体**（`arialbd`）⇒ **一个汉字字形都没有**，
+    中文会被画成**豆腐块（□）** —— 主人 2026-09-30 报的"乱码"就是这个。
+    ⇒ **含非 ASCII ⇒ 用 `FONT_CJK`（微软雅黑）**；
+      **纯 ASCII ⇒ 维持 `FONT_SMALL`**（★ `FAIRY WORKING` 这类英文副标题观感**一字不变**）。
+    """
+    import step17_hdd_progress as S17
+    t = txt or u""
+    try:
+        t.encode("ascii")
+    except UnicodeEncodeError:
+        return getattr(S17, "FONT_CJK", S17.FONT_SMALL)
+    return S17.FONT_SMALL
+
+
+# ★★ 2026-09-30（主人 17:0x 拍板）：**不缩字号，改为超长截断**
+#   原委：上一版为"不超条宽"把字号从 16 缩到 12 ⇒ 主人："字太小了"。
+#   ⇒ 改成 **字号保持 `cap_px`**（跟原来一样大），放不下就**末尾截断 + 省略号**，
+#     让副标题宽度**尽量贴近条宽**（主人要"跟进度条基本等长"）。
+CAP_ELLIPSIS = u"\u2026"          # 省略号 …
+
+
+def truncate_caption(txt, max_w, px, ell=CAP_ELLIPSIS):
+    u"""→ (要显示的文本, 是否被截断)。**不改字号**，只截文本。
+
+    ★★ 判据口径**必须与最终渲染一致** —— 直接用 `caption_rgba()` 的位图宽度量。
+      踩过的坑：早先用 `S17._stroke_mask()` 的**字面遮罩宽**来判，它含斜体倾斜、
+      却不含发光外扩 ⇒ 两者口径不同 ⇒ 判得**偏保守**（明明还有余量就提前截了，
+      副标题只填到条宽的 **81%**，达不到主人要的"基本等长"）。
+    ★ `caption_rgba()` 自带按 (文字, 字号) 的缓存 ⇒ 反复量也不贵。
+    """
+    if not txt:
+        return txt, False
+    W = caption_rgba(px, txt).width
+    if W <= max_w:
+        return txt, False
+    # 粗估能放几个字（宽度随字数近似线性），**从估算点向前微调**，免得一路试
+    n = int(len(txt) * float(max_w) / max(1.0, float(W)))
+    n = max(1, min(len(txt) - 1, n + 2))
+    while n >= 1:
+        cand = txt[:n] + ell
+        if caption_rgba(px, cand).width <= max_w:
+            return cand, True
+        n -= 1
+    return txt[:1] + ell, True
+
+
 def caption_rgba(px, text=None):
     """副标题位图（描边斜体 + 内外发光），按 **(文字, 字号)** 缓存。
 
@@ -191,7 +240,7 @@ def caption_rgba(px, text=None):
                         face_top=s["face_top"], face_bot=s["face_bot"],
                         dark_col=s["dark_col"], edge_col=s["edge_col"],
                         dark_a=s["dark_a"],
-                        fonts=S17.FONT_SMALL)
+                        fonts=_fonts_for(txt))        # ★ 2026-09-30 按内容选（含中文⇒雅黑）
     _CAP[key] = t
     return t
 
@@ -395,7 +444,20 @@ class BarView:
           **必须重算这几个量**，否则条与副标题会错位。
         ★ `_solid` / `_moire` **不用清** —— 它们只跟条的 pct 与相位有关，与 `cap` 无关。
         """
-        self.cap = caption_rgba(self.cap_px, self.cap_text) if CAPTION_ENABLE else None
+        # ★★ 2026-09-30 17:0x（主人拍板）：**字号保持 `cap_px` 不动，超长就截断**。
+        #   上一版用 `fit_px` 缩字号（16→12）⇒ 主人："**字太小了**"。
+        #   ⇒ 现在：字号**不变**（跟原来一样大），放不下就从**末尾截断并加省略号**，
+        #     让副标题宽度尽量贴近条宽（主人要"**跟进度条基本等长**"）。
+        #   ★ 画布**不用加高** —— `geom()` 里条是**锚在画布底往上推**的
+        #     （`y = S - bot - cap_h - gap - h`），副标题变高只会让条**上移几 px**。
+        shown = self.cap_text
+        if CAPTION_ENABLE and self.cap_text:
+            try:
+                shown, _cut = truncate_caption(
+                    self.cap_text, geom(self.S)[0], self.cap_px)
+            except Exception:
+                shown = self.cap_text      # ★ 截断失败绝不能让"条"画不出来
+        self.cap = caption_rgba(self.cap_px, shown) if CAPTION_ENABLE else None
         self.cap_gap = max(2, int(round(self.h * CAP_GAP_F))) if self.cap is not None else 0
         self.w, self.h, self.x, self.y = geom(
             self.S, self.cap.height if self.cap is not None else 0)

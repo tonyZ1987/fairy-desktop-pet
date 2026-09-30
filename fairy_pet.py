@@ -723,30 +723,29 @@ class FairyPet:
 
         ★ 置顶开关、活动感知开关、**开机是否播动画**、**通知卡字体档**都跟位置存在
           同一个文件里 ⇒ **重启后保持你的选择**。
+
+        ★★ 2026-09-28 主人拍板：「**归位和开机全都默认在主屏幕右下**」
+          ⇒ 存档里的 `x/y` **不再决定启动位置**。原因：跨屏改造后存档可能落在任何一块屏上
+            （副屏、3 屏…），而主人要的是"开机就在主屏右下"。
+            `x/y` 照样写、照样留档（诊断用），只是**启动时不读它** ——
+            位置一律走 `_home_xy()`（主屏工作区右下，已含"可见内容躲开任务栏"）。
         """
+        fk = FONT_DEFAULT
+        topmost, sense, boot = True, True, True
         try:
             d = json.load(open(POS_FILE, "r", encoding="utf-8"))
-            x, y = int(d["x"]), int(d["y"])
-            # ★★ 2026-09-23（主人："位置能**根据 1 块屏幕**去定位"）：
-            #   存档位置可能来自"已经拔掉的那块屏"（外接显示器 / 投屏 / 换机器），
-            #   也可能贴到屏幕外（旧版本没有夹取）⇒ 一律 `SCR.fit()` 夹进**主屏**，
-            #   并按"可见内容"算 ⇒ 通知卡不会被屏幕切掉。夹动了就写一行日志，别静默。
-            fx, fy = SCR.fit(x, y, self.win)
-            if (fx, fy) != (x, y):
-                out(u"[screen] 存档位置 (%d,%d) 超出主屏可见范围 ⇒ 夹到 (%d,%d)"
-                    % (x, y, fx, fy))
             fk = str(d.get("font", FONT_DEFAULT))
             if fk not in FONT_KEYS:          # ★ 存档里是个不认识的 key ⇒ 回默认，别崩
                 out(u"[font] 存档里的字体档 %r 不认识 ⇒ 用默认 %s" % (fk, FONT_DEFAULT))
                 fk = FONT_DEFAULT
-            return (fx, fy,
-                    bool(d.get("topmost", True)), bool(d.get("sense", True)),
-                    bool(d.get("boot", True)), fk)
+            topmost = bool(d.get("topmost", True))
+            sense = bool(d.get("sense", True))
+            boot = bool(d.get("boot", True))
         except Exception:
             pass
-        # 没有存档 / 存档不可用 ⇒ 主屏右下角（`fairy_screen.home`，已含卡片夹取）
+        # 位置：**一律主屏右下**（不看存档坐标，理由见上面 docstring）
         hx, hy = self._home_xy()
-        return hx, hy, True, True, True, FONT_DEFAULT
+        return hx, hy, topmost, sense, boot, fk
 
     def _save_pos(self):
         try:
@@ -2462,10 +2461,14 @@ class FairyPet:
                     # ★★ 2026-09-23 主人："往右下角移动后，超出屏幕边界了……位置能**根据 1 块屏幕**
                     #   去定位，而且尤其**通知框**不要超出屏幕"。
                     #   原来拖动**一点夹取都没有**（甩出屏幕就找不回来了）。
-                    #   ⇒ 每帧夹进**主屏**，且按"可见内容"算（通知卡在画布里左右各留
-                    #     `CARD_INSET`）⇒ 卡片右端不会再被屏幕切掉。
-                    self.x, self.y = SCR.fit(p.x - self.drag_off[0],
-                                             p.y - self.drag_off[1], self.win)
+                    #   ⇒ 每帧夹一次，且按"可见内容"算（通知卡在画布里左右各留 `CARD_INSET`）。
+                    # ★★ 2026-09-28 **拖动改用 `fit_drag()`**（过渡态）：夹进整个虚拟桌面，
+                    #   只把"压到任务栏"推开 ⇒ 能贴着手横穿到任何一块屏（3 屏 4 屏同理）。
+                    #   ★ 实测：用 `fit()` 会在两屏交界"卡住一段再瞬移"（260 档 171/342 px、
+                    #     200 档 128/256、320 档 214/428）—— 不跟手，所以拖动必须用过渡态。
+                    #   ★ 松手（WM_LBUTTONUP）才用 `fit()` 吸进"所在那块屏"的工作区。
+                    self.x, self.y = SCR.fit_drag(p.x - self.drag_off[0],
+                                                  p.y - self.drag_off[1], self.win)
                     self.tick()
                 elif self.drag_slider and self.menu_open:
                     p = POINT()
@@ -2480,6 +2483,12 @@ class FairyPet:
             if msg == WM_LBUTTONUP:
                 if self.dragging:
                     self.dragging = False
+                    # ★★ 2026-09-28：**松手才"吸附"** —— 拖动中用的是宽松的 `fit_drag()`
+                    #   （夹进整个虚拟桌面 + 只躲任务栏），松手这里再用 `fit()` 把窗口
+                    #   吸进**它中心所在那块屏**的工作区。
+                    #   ⇒ 松手后一定"完整落在某一块屏的可用区里、且不压那块屏的任务栏"；
+                    #     存进 `pos.json` 的也就是这个值（副屏上的位置记得住）。
+                    self.x, self.y = SCR.fit(self.x, self.y, self.win)
                     self._save_pos()
                     # ★★ STEP18：**单击桌宠 ⇒ 展开 / 收起聊天窗**。
                     #   判据两条一起用：位移 ≤ 5 px（否则是拖动）**且**按住 < 0.4 s
@@ -2663,8 +2672,10 @@ class FairyPet:
         gdi32.DeleteObject(self._dib)
         gdi32.DeleteDC(self._hdc)
         self._init_dib()
-        # ★★ 2026-09-23：换尺寸后按**主屏**重新夹一次（原来按虚拟桌面夹，副屏会被算进来）。
+        # ★★ 2026-09-23：换尺寸后重新夹一次（原来按虚拟桌面夹，副屏会被算进来）。
         #   用 `SCR.fit()` ⇒ 连通知卡的可见范围一起保证（主人："通知框不要超出屏幕"）。
+        # ★★ 2026-09-28 多屏化后：`fit()` 改成**按窗口所在那块屏**夹 ⇒
+        #   在副屏上换尺寸就留在副屏，并且躲开**副屏那条**任务栏（不再一律夹回主屏）。
         self.x, self.y = SCR.fit(self.x, self.y, self.win)
         user32.SetWindowPos(self.hwnd, None, self.x, self.y, self.win, self.win, 0x0014)
         self._save_pos()

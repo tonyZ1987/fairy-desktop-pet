@@ -62,6 +62,17 @@ FONT_SMALL = ["C:/Windows/Fonts/arialbd.ttf",
               "C:/Windows/Fonts/impact.ttf",
               "C:/Windows/Fonts/ariali.ttf"]
 
+# ★★ 2026-09-30 主人拍板：**中文字体表**
+#   为什么需要它：`FONT_SMALL` / `FONT_BIG` 里**全是纯西文字体**。
+#   进度条副标题从「FAIRY WORKING」（纯英文）换成「**项目短名**」（含中文）之后，
+#   `arialbd` **零个汉字字形** ⇒ 中文被画成**豆腐块（□）**
+#   —— 这就是主人 2026-09-30 报的"下面显示的不是文字是乱码"。
+#   ⇒ **含非 ASCII 的文字一律走这份表**（`fairy_bar._fonts_for()` 按内容自动选）。
+#   ★ 主人 2026-09-30 14:4x 从对照图里**点名**：用**微软雅黑**（从上往下第 3 行）。
+FONT_CJK = ["C:/Windows/Fonts/msyh.ttc",          # 微软雅黑（★ 主人点名，首选）
+            "C:/Windows/Fonts/simhei.ttf",        # 黑体（兜底）
+            "C:/Windows/Fonts/msyhbd.ttc"]        # 微软雅黑 Bold（兜底）
+
 _CACHE = {}
 
 
