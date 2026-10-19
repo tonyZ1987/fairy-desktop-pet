@@ -48,3 +48,13 @@ activity_project.txt
 *.tmp
 *_report.txt
 *_summary.txt
+
+# ---------- v2.3：DSH（DeepSeek Harness）桥接 —— 同样是本机运行时产物 ----------
+dsh_events.jsonl
+dsh_bridge_selftest.jsonl
+dsh_hooks.json
+fairy_dsh_bridge.log
+fairy_dsh_off
+dsh_bridge_report.txt
+dsh_bridge_summary.txt
+_flags_dsh/

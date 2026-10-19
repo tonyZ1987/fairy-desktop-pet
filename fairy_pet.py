@@ -208,7 +208,12 @@ PCT_EASE_RATE = 60.0        # ★★ 2026-09-23 主人：「90% 以内的进度�
 #     所以"任务中途插嘴"**天然**不可能误退（那时 `prog_done` 为假，根本进不去）。
 #   ★ 为什么不用「等第二轮指令」：那句回复我还要生成、渲染，他**读到**之前我这边早就完成了；
 #     而他一旦开始敲字，就说明他已经看完了 ⇒ 这才是"他看见了"的第一手信号。
+#   ★★ 2026-10-19：**同时认 DSH** —— 主人换了宿主（WorkBuddy → DeepSeek Harness），
+#     "收尾时他一动手就让位"这条判据必须照样成立，否则 100% 会一直挂到他切窗口。
+#     进程名实测：`DeepSeek Harness.exe`（任务管理器里就这么写，带空格）。
 WB_EXE = "workbuddy.exe"    # 前台窗口属这个进程 ⇒ 主人正对着 WorkBuddy（2026-09-23 实测进程名）
+DSH_EXE = "deepseek harness.exe"   # ★ DSH 桌面版的进程名（2026-10-19 实测）
+WB_EXES = (WB_EXE, DSH_EXE)
 TYPING_IDLE_MS = 1200       # 多久没有键鼠输入就算"没在打字"（打字节奏远快于 1.2 s）
 MOVE_S = 1.60               # 开机动画结束后，主体从屏幕中心走到目标位的时长
 MOVE_DELAY = 1.00           # ★ 主人 2026-09-22 23:1x：「在中心**待 1 秒**后，再去右下角」
@@ -251,7 +256,7 @@ def note_group(kind):
 #   尺寸   [小][中][大]      260 px  ← 三档滑块 + 右侧标注实际像素
 #   模式   [自动][手动]              ← 两档滑块
 #   状态   [常态][工作态]            ← **手动时**才出现
-#   自动   [跟随 WorkBuddy][60 秒循环] ← **自动时**才出现
+#   自动   [AI][演示循环]            ← **自动时**才出现（"AI" = DSH / WorkBuddy 哪个在干活跟哪个）
 #   归位（右下角） / 退出 fairy
 MENU_TITLE_H = 22
 MENU_ROW_H = 26
@@ -497,7 +502,10 @@ class FairyPet:
         self.menu_page = ""
         # ★ 会话活动侦测：主人一发指令 → 会话记录立刻落盘 → 我这边 0.5 s 内切工作态。
         #   不依赖我记得写 state.json（我漏过一次），这正是主人 2026-09-22 要的时机。
-        self.act = FA.ActivityWatch()
+        #   ★★ 2026-10-19：改成 `make_watcher()` = **多来源合并**（DSH + WorkBuddy）。
+        #     主人换了宿主（WorkBuddy → DeepSeek Harness），能力不变：
+        #     哪边在干活就跟哪边（详见 `fairy_activity.MergeWatch` 的说明）。
+        self.act = FA.make_watcher()
         # ★★ 2026-09-23：pid → exe 全路径的缓存（收尾让位判据 `_typing_in_wb` 用；
         #   收尾期每 0.5 s 要问一次"前台窗口是谁"，不缓存就得反复 OpenProcess）
         self._exe_cache = {}
@@ -582,6 +590,13 @@ class FairyPet:
         self._bar_owner = u""
         self._settled = False           # 已交付超 DONE_SETTLE_S ⇒ 强制常态，直到下一轮开工
         self.prog_poll_at = 0.0
+        #   ★★ 2026-10-19：**阶段进度**（DSH 的 todos 投影折算）的节流时刻 + 上次写进去的百分比。
+        #      `_prog_from_stage` 每 1 s 最多跑一次（它要读一次 JSON）。
+        self._stage_at = 0.0
+        self._stage_pct = None
+        #   ★ 上一次自动写盘用的项目 —— **收工时要靠它**（那时 `stage()` 已经返回 None，
+        #     光看返回值拿不到项目名，就会撤不掉自己写的那条）。
+        self._stage_proj = u""
         self._prog_mtime = 0.0      # progress.json 的最后写入时间（判"是不是这一轮新上报的"）
         self._bar_epoch = 0.0       # 本轮工作开始时 progress.json 的版本（见 _bar_wanted 的 ⑤）
         self._bar_shown = False     # 这条进度条**本轮是否已经露过面**（决定要不要播出现动画）
@@ -1042,7 +1057,34 @@ class FairyPet:
                 #     全局那份可能留着**别的项目**刚交付的 100%（主人截图那条
                 #     「换个项目就出现这个问题了，刚进入工作态的时候，就是带工作条的」）。
                 #   ★ 而 `_prog/` 一个文件都没有（老环境 / 单项目自检）⇒ 仍然回落，行为不变。
-                return None, False, True, 0.0, False, u""
+                #
+                #   ★★★ 2026-10-19 修正（主人当天原话）：
+                #     「回复+交付完，进度跳**正好到 100%**，桌宠弹卡片提醒我去查收」。
+                #     ⇒ 这里**漏了一种情况**：**刚交付的那一条**（带 `settle`、且还在
+                #       收尾窗口内）必须**继续显示 100%**，否则条在弹卡的同一瞬间就消失了
+                #       —— 主人根本看不到"跑到 100"。
+                #     ★ 09-24 那条规则讲的是**不接棒给别的项目**，不是"把自己的 100% 藏起来"。
+                _recent = None
+                try:
+                    _now = time.time()
+                    for _p2, _d2 in self._prog_files().items():
+                        if not _d2.get(u"settle"):
+                            continue
+                        if (_now - float(_d2.get(u"ts") or 0.0)) > (DONE_SETTLE_S + 5.0):
+                            continue
+                        if (_recent is None
+                                or float(_d2.get(u"ts") or 0.0)
+                                > float(_recent[1].get(u"ts") or 0.0)):
+                            _recent = (_p2, _d2)
+                except Exception:
+                    _recent = None
+                if _recent is None:
+                    return None, False, True, 0.0, False, u""
+                _alt = proj_file(_recent[0])
+                if os.path.exists(_alt):
+                    _path = _alt           # ⇒ 继续走下面"正常读一份"的路
+                else:
+                    return None, False, True, 0.0, False, u""
         except Exception:
             _path = PROGRESS_FILE
         try:
@@ -1060,6 +1102,189 @@ class FairyPet:
         except Exception as e:
             log_err("read_progress", e)
             return None, False, True, 0.0, False, u""
+
+    # ================================================== ★★ 阶段进度（2026-10-19）
+    def _prog_from_stage(self):
+        u"""把 **DSH 的 `todos` 投影**折算成进度条（AI 没自己上报时）。
+
+        ## 这件事为什么现在才做得了
+        WorkBuddy 是**闭源**的，桌宠拿不到任何"任务进度"通道 —— 那会儿只能靠我
+        `--item K P` **手工报**（漏报一次就断档，主人 09-23 亲眼见过条从 30% 蹦到 90%）。
+        DSH 把 `todo_write` 的清单投影成**明文 JSON**（`record.rows.todos.val`），
+        而且**每个 turn 开始就重置** ⇒ 它天然就是"这一轮拆了几步、走到第几步"。
+        ⇒ 桌宠可以**自己算**，不需要 AI 额外配合。
+
+        ## 三条规矩
+        1. **人工优先**：本轮（`_bar_epoch` 之后）那份进度文件如果是我用 `fairy_notify`
+           写的（没有 `auto` 标记），这里**一个字都不动**；
+        2. **只写项目专属那份**（`_prog/progress_<项目>.json`），不碰全局 `progress.json`、
+           不碰 `state.json`、不碰 `notify.json`；
+        3. **收工要撤**：这一轮关掉（`stage()` 返回 None）就把自己那条标成 `done`
+           —— 否则它会以"未交付任务"的身份把桌宠多挂 5 分钟（`TASK_STALE_S`）。
+        """
+        if not (self.sense and self.follow and self.auto_mode == "follow"):
+            return
+        now = time.time()
+        if now - self._stage_at < 1.0:
+            return
+        self._stage_at = now
+        stage = None
+        try:
+            stage = self.act.stage()
+        except Exception as e:
+            log_err("stage", e)
+            return
+        pj = (stage or {}).get("project") or (self._stage_proj or u"")
+        path = proj_file(pj) if pj else u""
+        old = {}
+        if path and os.path.exists(path):
+            try:
+                with open(path, u"r", encoding=u"utf-8") as f:
+                    old = json.load(f) or {}
+            except Exception:
+                old = {}
+        # ---- ① 人工优先：本轮我上报过，就退出 ----
+        if old and old.get(u"auto") is not True:
+            try:
+                if float(old.get(u"ts") or 0.0) > self._bar_epoch:
+                    self._stage_pct = None
+                    return
+            except Exception:
+                pass
+        # ---- ② 没有阶段数据 ⇒ 要么"刚交付"，要么"这一轮散了"----
+        if not stage:
+            #   ★★ 2026-10-19 主人：「只要能做到，回复+交付完，进度跳正好到 100%，
+            #      桌宠弹卡片提醒我去查收就行。」
+            #      ⇒ 先问感知"刚交付的那一轮"（= turn 关掉 + 清单全绿）。
+            fin = None
+            try:
+                fin = self.act.finished()
+            except Exception as e:
+                log_err("finished", e)
+            if fin:
+                if self._auto_finish(fin):
+                    return
+            if path and old.get(u"auto") is True and not old.get(u"done"):
+                self._write_stage_file(path, {"percent": 100.0, "done": True,
+                                              "note": u"阶段结束（自动）",
+                                              "ts": now})
+                out(u"[stage] %s ⇒ 收工（自动进度撤下）" % (pj or u"?",))
+            self._stage_pct = None
+            self._stage_proj = u""
+            return
+        if not path:
+            return
+        # ---- ③ 写进去（百分比变了才落盘，免得每秒写文件）----
+        pct = float(stage.get(u"percent") or 0.0)
+        if self._stage_pct is not None and abs(pct - self._stage_pct) < 1.0 \
+                and old.get(u"auto") is True:
+            return
+        nm = int(stage.get(u"completed") or 0)
+        nt = int(stage.get(u"total") or 0)
+        lab = (stage.get(u"label") or u"").strip()
+        note = u"%d/%d%s · %s" % (nm, nt, u"（进行中）" if stage.get(u"active") else u"",
+                                  lab) if nt else (lab or u"自动阶段")
+        self._write_stage_file(path, {
+            u"percent": pct, u"done": False, u"planned": True,
+            u"project": pj, u"ts": now, u"auto": True,
+            u"note": note[:40],
+            u"started_at": float(old.get(u"started_at") or now),
+        })
+        self._stage_pct = pct
+        self._stage_proj = pj
+        out(u"[stage] %s ⇒ %.0f%%（%s）" % (pj or u"?", pct, note))
+
+    def _auto_finish(self, fin):
+        u"""「回复+交付完 ⇒ **正好 100%** + 弹卡」——走与人 `--reply` **同一条**收尾路径。
+
+        主人 2026-10-19 原话：
+        「当时 90-95-100 的规则，是因为在 workbuddy 时期做不到 agent 回复完 + 交付完
+          正好到 100% 状态；现在的 dsh 时期如果能做到，那就用你自己的…… 只要能做到，
+          回复+交付完，进度跳正好到 100%，桌宠弹卡片提醒我去查收就行。」
+
+        ## DSH 凭什么做得到
+        `fairy_activity_dsh.finished()` 给出的判据是**宿主自己的事实**：
+        `openTurnStartSeq` 变空（= 这一轮结束了，回复已经写完）
+        **且** `todos` 全部 `completed`（= 活确实干完了）⇒ 此刻补 90→100 是**如实的**。
+        WorkBuddy 那会儿没有这个信号，只能靠 `--reply` 让我自己喊。
+
+        ## 三件事（与 `fairy_notify.do_reply` 完全同形）
+        1. `notify.json` = 完成卡（主人定稿的句式）；
+        2. 项目进度 = 100 + `done` + `settle`（桌宠据此把 100% **显示出来**，并从此刻起
+           按 `DONE_SETTLE_S` 收尾：主人开口 / 打字 / 兜底 60 s）；
+        3. `state.json` = working（让那 100% 挂着，收尾由桌宠自己计时，不由文件撒谎）。
+
+        返回 `True` = 这次真的弹了卡。
+        """
+        pj = (fin.get(u"project") or self._stage_proj or u"")
+        n = int(fin.get(u"total") or 0)
+        now = time.time()
+        #   ★ 人工已经交过（`--reply` 写了 100 + settle + 卡）⇒ **不重复弹**
+        try:
+            if self.prog_done and self.prog_settle and self._prog_mtime > self._bar_epoch:
+                return False
+        except Exception:
+            pass
+        short = u""
+        try:
+            import fairy_notify as _N
+            short = _N.proj_short(pj) if pj else u""
+        except Exception as e:
+            log_err("auto_finish:short", e)
+        if short and n > 0:
+            card = u'主人，"%s"工作空间的项目已完成%d项修改，请前往查阅。' % (short, n)
+        elif n > 0:
+            card = u"主人，已完成%d项修改，请前往查阅。" % n
+        else:
+            card = u"主人，本次任务已完成，请前往查阅。"
+        # ---- ① 卡 ----
+        try:
+            tmp = NOTIFY_FILE + u".tmp"
+            with open(tmp, u"w", encoding=u"utf-8") as f:
+                json.dump({u"text": card, u"ts": now, u"secs": 12.0,
+                           u"kind": u"done", u"auto": True}, f, ensure_ascii=False)
+            os.replace(tmp, NOTIFY_FILE)
+        except Exception as e:
+            log_err("auto_finish:notify", e)
+            return False
+        # ---- ② 进度 100 + settle ----
+        path = proj_file(pj) if pj else PROGRESS_FILE
+        self._write_stage_file(path, {
+            u"percent": 100.0, u"done": True, u"planned": True,
+            u"settle": True, u"settle_s": DONE_SETTLE_S,
+            u"project": pj, u"ts": now, u"auto": True,
+            u"stages": max(1, n), u"item": max(1, n), u"phase": 3,
+            u"note": card[:40],
+            u"started_at": float(fin.get(u"closed_at") or now),
+        })
+        # ---- ③ state.json = working（100% 挂着，收尾交给 settle 计时）----
+        try:
+            tmp = STATE_FILE + u".tmp"
+            with open(tmp, u"w", encoding=u"utf-8") as f:
+                json.dump({u"state": u"working",
+                           u"ts": time.strftime(u"%Y-%m-%dT%H:%M:%S"),
+                           u"ttl": 300, u"note": card[:40]}, f, ensure_ascii=False)
+            os.replace(tmp, STATE_FILE)
+        except Exception as e:
+            log_err("auto_finish:state", e)
+        self._stage_pct = 100.0
+        self._stage_proj = pj
+        out(u"[stage] %s ⇒ **交付完成 100%%**，已弹完成卡：%s" % (pj or u"?", card))
+        return True
+
+    @staticmethod
+    def _write_stage_file(path, rec):
+        u"""原子写项目专属进度文件（先 .tmp 再 replace）—— 与 `fairy_notify` 同一手法。"""
+        try:
+            d = os.path.dirname(path)
+            if d and not os.path.isdir(d):
+                os.makedirs(d)
+            tmp = path + u".tmp"
+            with open(tmp, u"w", encoding=u"utf-8") as f:
+                json.dump(rec, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception as e:
+            log_err("stage_write", e)
 
     def _bar_wanted(self):
         u"""此刻**该不该**画出进度条。
@@ -1173,7 +1398,10 @@ class FairyPet:
             所以"任务中途插嘴"不可能误退：那时 `prog_done` 为假，压根进不到那一支。
 
         两条判据缺一不可（都够便宜：跑在 0.5 s 一次的量级上，不在每帧里）：
-          ① 前台窗口的 exe == `workbuddy.exe`  ⇒ 他正对着 WorkBuddy，而不是别的程序；
+          ① 前台窗口的 exe 是 `workbuddy.exe` **或 `DeepSeek Harness.exe`**
+             ⇒ 他正对着 AI 那边，而不是别的程序；
+             ★ 2026-10-19：宿主换成 DSH 之后，只认 workbuddy 就会出现
+               "100% 一直挂着、直到他切窗口"（永远匹配不上）。
           ② 系统空闲时间 < `TYPING_IDLE_MS`     ⇒ 刚有输入（键/鼠任一）。
              用 `GetLastInputInfo` 而不是扫键盘：后者要轮询几百个虚拟键，而且抓不到
              "用滚轮翻我的回复"——那同样说明**他在看**。
@@ -1186,8 +1414,8 @@ class FairyPet:
                 return False
             pid = wintypes.DWORD()
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            exe = self._pid_exe(pid.value)
-            if not exe or not exe.lower().endswith(WB_EXE):
+            exe = (self._pid_exe(pid.value) or u"").lower()
+            if not exe or not any(exe.endswith(x) for x in WB_EXES):
                 return False
             li = LASTINPUTINFO()
             li.cbSize = ctypes.sizeof(LASTINPUTINFO)
@@ -1361,7 +1589,10 @@ class FairyPet:
         """
         seg, fname, _ = font_meta(self.font_key)
         if self.follow:
-            beh = (u"WorkBuddy" + (u" · 感知开" if self.sense else u" · 感知关")
+            #   ★★ 2026-10-19：这里原来写死「WorkBuddy」—— 主人已经换成 DSH，
+            #     菜单上还挂着旧宿主的名字会误导（"它到底在跟谁？"）⇒ 统一叫「AI」，
+            #     具体跟 DSH 还是 WorkBuddy 由 `MergeWatch` 自己挑，心跳里能看到。
+            beh = (u"AI" + (u" · 感知开" if self.sense else u" · 感知关")
                    if self.auto_mode == "follow" else u"演示循环")
         else:
             beh = u"手动 · " + (u"工作态" if self.manual == "working" else u"常态")
@@ -1419,6 +1650,9 @@ class FairyPet:
              固定显示会让人以为拨了有用）；
           ③ 段名「跟随 WorkBuddy / 60 秒循环」→「**WorkBuddy / 演示循环**」（短，
              且"演示"二字说清它非正式）。
+          ★★ 2026-10-19：宿主换成 DSH 之后，第一段改成「**AI**」——
+             它现在指的是"**任意一个 AI 宿主**"（DSH 优先、WorkBuddy 兜底，见
+             `fairy_activity.make_watcher`）。写死宿主的名字会随主人换工具而过期。
         """
         rows = [{"kind": "title", "text": "行为"},
                 {"kind": "slider", "key": "mode", "label": "模式",
@@ -1426,9 +1660,10 @@ class FairyPet:
                  "help": u"自动 = Fairy 自己判断状态；手动 = 听你的"}]
         if self.follow:
             rows.append({"kind": "slider", "key": "auto", "label": "来源",
-                         "segs": ["WorkBuddy", "演示循环"],
+                         "segs": ["AI", "演示循环"],
                          "idx": 0 if self.auto_mode == "follow" else 1,
-                         "help": u"WorkBuddy = 读我上报的状态；"
+                         "help": u"AI = 读我上报的状态 + 感知"
+                                 u"（DSH / WorkBuddy 哪个在干活就跟哪个）；"
                                  u"演示循环 = 本地 60 秒自己交替（演示用）"})
             # ★★ 判据必须是 **`auto_mode == "follow"`**，不能只看 `self.follow`：
             #   `_target_state()` 里感知的生效条件正是
@@ -1498,7 +1733,7 @@ class FairyPet:
             elif r["kind"] == "nav":
                 need = max(need, self._slider_need(d, [], r.get("extra")) + 12)
         # ★ 把**另一种模式**的那一行也算进来 ⇒ 菜单宽度恒定，切自动/手动时不会横向跳
-        for cand in (["WorkBuddy", "演示循环"], ["常态", "工作态"]):
+        for cand in (["AI", "演示循环"], ["常态", "工作态"]):
             need = max(need, self._slider_need(d, cand, None))
         w = min(x_slider + need + MENU_PAD, max(200, self.win - 12))
         y0 = max(6, int(self.win * 0.035))
@@ -2270,6 +2505,9 @@ class FairyPet:
             st, _note = self._read_state_json()
             if st != self.auto_state:
                 self.auto_state = st
+            #   ★★ 2026-10-19：**AI 没自己上报时，用 DSH 的 todos 自动推进度条**。
+            #   放在这里（0.5 s 一次的档），不占每帧预算；内部还有 1 s 节流。
+            self._prog_from_stage()
         self._set_state(self._target_state(now), now)
 
         # --- ★ 进度条的出现状态机（2026-09-22 主人定的时序）---
@@ -2306,7 +2544,17 @@ class FairyPet:
         if self._pct_tgt >= self._pct_disp:
             self._pct_disp = min(self._pct_tgt, self._pct_disp + PCT_EASE_RATE * _dt)
         else:
-            self._pct_disp = self._pct_tgt        # 目标变小 = 新一轮 ⇒ 吸附，不播倒退动画
+            #   ★★ 2026-10-19 主人：「中途加任务，对进度条进行**动态调整**（即可能回退、
+            #      也可能前进）……如果可以，那就做」。
+            #   ⇒ 分两种"变小"，不能一律吸附：
+            #     · **条正挂着、还在同一轮**（`_bar_want` 且已经出现过）⇒ **平滑退回**
+            #       （同样 1%/帧）—— 主人要能"看见"任务变多了；
+            #     · **新一轮**（条刚重新出现 / 上一轮残留的 100%）⇒ 仍然**吸附**，
+            #       否则会出现"100% 一路倒着扫回 0%"的怪画面。
+            if self._bar_want and self._bar_shown and self._bar_rev is None:
+                self._pct_disp = max(self._pct_tgt, self._pct_disp - PCT_EASE_RATE * _dt)
+            else:
+                self._pct_disp = self._pct_tgt    # 新一轮 ⇒ 吸附，不播倒退动画
 
         # --- ★ 登场位移：开机动画结束 ⇒ 主体在屏幕中央出现 ⇒ 自己走到目标位 ---
         #   （见 `play_boot`；`_blit` 是按 self.x/self.y 上传的，所以改这两个数就是移动）
@@ -2540,7 +2788,7 @@ class FairyPet:
                     self.follow = True
                     self.manual = None
                     self.auto_loop_at = time.perf_counter() + AUTO_LOOP_S
-                    self._say("自动：%s" % ("跟随 WorkBuddy" if self.auto_mode == "follow"
+                    self._say("自动：%s" % ("跟随 AI" if self.auto_mode == "follow"
                                             else "60 秒循环"), 2.2)
             else:
                 if self.follow:
@@ -2556,7 +2804,8 @@ class FairyPet:
             if m != self.auto_mode:
                 self.auto_mode = m
                 self.auto_loop_at = time.perf_counter() + AUTO_LOOP_S
-                self._say("跟随 WorkBuddy" if m == "follow" else "60 秒循环（演示）", 2.2)
+                self._say("跟随 AI（DSH / WorkBuddy）" if m == "follow"
+                          else "60 秒循环（演示）", 2.2)
         elif key == "state":
             st = "idle" if k == 0 else "working"
             if st != self.manual:

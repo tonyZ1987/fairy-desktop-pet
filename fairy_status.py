@@ -120,6 +120,30 @@ if os.path.exists(ERRLOG):
 else:
     L.append("错误日志: 无")
 
+# ---------- 4b. ★ 2026-10-19：DSH 桥接（主机从 WorkBuddy 换成 DeepSeek Harness）----------
+#   ★ 为什么放进体检：主人只会问一句"它怎么不动了"，而这条链路有四段
+#     （DSH 钩子 → 事件流 → 感知 → 状态机），不逐段报出来就只能靠猜。
+DEVENT = os.path.join(BASE, "dsh_events.jsonl")
+DLOG = os.path.join(BASE, "fairy_dsh_bridge.log")
+DHOOKS = os.path.join(BASE, "dsh_hooks.json")
+DROWS = []
+if os.path.exists(DEVENT):
+    try:
+        DROWS = [x for x in open(DEVENT, encoding="utf-8", errors="replace")
+                 .read().splitlines() if x.strip()]
+    except Exception:
+        DROWS = []
+L.append("DSH桥接: hooks.json=%s   事件流=%s"
+         % ("有" if os.path.exists(DHOOKS) else "**缺**（双击 install_dsh_bridge.vbs）",
+            ("%d 条，最后一条 %.1f 分钟前" % (len(DROWS), (time.time() - os.path.getmtime(DEVENT)) / 60.0))
+            if DROWS else "**还没有事件**"))
+if DROWS:
+    L.append("         " + DROWS[-1][:150])
+if os.path.exists(DLOG):
+    _dl = [x for x in open(DLOG, encoding="utf-8", errors="replace").read().splitlines() if x.strip()]
+    if _dl:
+        L.append("         桥接日志最后一行：" + _dl[-1][:140])
+
 # ---------- 5. 结论 ----------
 L.append("-" * 46)
 if not os.path.exists(BEAT):

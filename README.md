@@ -41,12 +41,29 @@ pip install -r requirements.txt
 然后**双击 `start_fairy.vbs`**。
 （改了代码要重启 → 用 **`restart_fairy.vbs`**：它先结束旧实例再起新的。）
 
-**想让 AI 干活时它自动半睁、报进度？**（v2.2 新增）
+### 想让 AI 干活时它自动半睁、报进度？
+
+#### ① DSH（DeepSeek Harness）—— v2.3 起的主要宿主
+
+**先看这条**：DSH 桌面版（Electron 打包版）**没有随包分发钩子桥接**
+（`app.asar` 里 306 个 `@deepseek-ai` 包，没有一个名字带 `hook`）⇒
+`install_dsh_bridge.vbs` 在桌面版上会被**明确拒绝**（并告诉你原因），这不是故障。
+
+**桌面版照样能用，而且进度条会自己走**：桌宠直接读 DSH 的 `todos` 投影
+（`todo_write` 的清单，明文 JSON，每秒更新）——**AI 不用报一格**，
+它把"这一轮拆了几步、走到第几步"折算成百分比。
+详见 **[`docs/STEP22_阶段进度（todos投影）.md`](docs/STEP22_阶段进度（todos投影）.md)**。
+
+只有在 **CLI 版 DSH**（`dsh` 命令）里，`install_dsh_bridge.vbs` 才有意义
+（它注入"让 AI 主动发完成卡 / `--abort`"的协议）。细节与四个实测坑见
+**[`docs/STEP21_DSH桥接与迁移.md`](docs/STEP21_DSH桥接与迁移.md)**。
+
+#### ② WorkBuddy（v2.2 的老通道，仍可用）
 
 1. 双击 **`install_agent_bridge.vbs`**，看到「装好了」即可；
 2. **开一个新的 AI 任务**（已经开着的老任务要新开一次才会读到）。
 
-之后不用管了。不想用了就双击 **`uninstall_agent_bridge.vbs`**（配置会摘干净）。
+两个通道**可以同时装着**：桌宠哪边在干活就跟哪边（右键「行为 → 来源」里那一档现在叫 **AI**）。
 
 ### 首次启动会慢一次，之后秒开
 
@@ -155,12 +172,18 @@ fairy-desktop-pet/
 ├── fairy_digits.py        工作态的 0/1 数字流
 ├── fairy_bar.py           进度条渲染器（唯一真源）
 ├── fairy_screen.py        启动时的屏幕测量：数屏 / 定档 / 定位
-├── fairy_activity.py      会话活动感知（读会话记录 ⇒ 自动进工作态）
+├── fairy_activity.py      会话活动感知（WorkBuddy 的 jsonl）+ **多来源合并** `make_watcher()`
+├── fairy_activity_dsh.py  ★ v2.3：**DSH** 的活动感知（会话投影缓存 + 钩子事件流）
 ├── fairy_boot.py          开机动画（含首次启动的倒计时窗）
 ├── fairy_notify.py        命令行发通知 / 改状态 / 报进度的小工具
 ├── fairy_bake.py          缓存预烘（可一次烘三档）
-├── fairy_status.py        一键体检（进程 / 窗口 / 心跳 / 日志）
+├── fairy_status.py        一键体检（进程 / 窗口 / 心跳 / 日志 / **DSH 桥接**）
 ├── step17_hdd_progress.py 自绘文字与数字的底层（描边 / 发光 / 字距）
+├── fairy_hook.py          v2.2：WorkBuddy 侧的桥接件（注入协议）
+├── agent_bridge_install.py v2.2：WorkBuddy 侧的一键装/卸
+├── fairy_dsh_hook.py      ★ v2.3：DSH 侧的桥接件（写事件流 + 注入协议）
+├── dsh_bridge_install.py  ★ v2.3：DSH 侧的一键装/卸/体检（装前自测、写前校验）
+├── fairy_dsh_bridge_prompt.md ★ v2.3：注入给 AI 的正文（想换措辞改这个）
 ├── glow_polar.npz         ★ 辉光的实测数据（从原素材量出来的，运行时必需，别删）
 ├── boot/                  开机动画素材（原作者见 NOTICE.md §5）
 ├── fonts/                 思源黑体（OFL 1.1，随包分发）
@@ -173,7 +196,8 @@ fairy-desktop-pet/
 运行时会自动生成（已在 `.gitignore` 里）：
 `_cache/*.npz`（预烘缓存，**可删，删了下次重烘**）、`heartbeat.txt`（心跳，**排障第一站**）、
 `pet_error.log`（只在出错时写；**程序装了全局异常钩子，未捕获异常只写这里、不上屏**）、
-`state.json` / `pos.json` / `progress.json` / `notify.json`。
+`state.json` / `pos.json` / `progress.json` / `notify.json`；
+装过桥接还会多出 `dsh_hooks.json` / `dsh_events.jsonl` / `fairy_dsh_bridge.log`（**都是本机运行时产物**）。
 
 ---
 
@@ -254,6 +278,39 @@ python fairy_status.py                :: 一键体检
 ## 九、更新日志
 
 倒序排列，详细的在 [`用户手册.html`](用户手册.html) 的「更新日志」页。
+
+### v2.3（2026-10-19）
+
+- **宿主从 WorkBuddy 换到 DSH（DeepSeek Harness）**：同一个"AI 一干活它就半睁、报进度"的能力，
+  现在**跟的是 DSH**（WorkBuddy 那条老通道**留着**，哪边在干活跟哪边）。
+- **半睁不再依赖 AI 自觉**：DSH 的**会话投影缓存**里有一条 `openTurnStartSeq`
+  （这一轮开着没有，连"你按停"都会反映），桌宠直接读它 ⇒ **你一按回车它就半睁，说完 25 秒自己睁眼**。
+- ★★ **进度条自己会走了**（这次最值钱的一条）：桌宠读 DSH 的 **`todos` 投影**
+  （= `todo_write` 的清单，明文 JSON、每秒更新、每个 turn 自动重置），把"这一轮拆了几步、
+  走到第几步"折算成百分比 —— **AI 不用报一格**。
+  **工作段只占 0~90**（全部勾完就停在 90，因为那时你还在写回复）；
+  AI **手工上报仍然优先**（`--plan/--item` 一写就接管，不会被自动值覆盖）。
+  → [`docs/STEP22_阶段进度（todos投影）.md`](docs/STEP22_阶段进度（todos投影）.md)
+- ★★ **交付时正好 100% + 自动弹卡**：DSH 能做到 WorkBuddy 当年做不到的事 ——
+  「这一轮结束（回复写完）+ 清单全绿」是可判的 ⇒ 桌宠在那一刻把 90 补到 **100%**，
+  并弹一张**完成卡**（`主人，"项目短名"工作空间的项目已完成N项修改，请前往查阅。`），
+  100% 挂 60 s / 你开口就回常态。
+  ★ 这替代了 WorkBuddy 时期凑出来的「90-95-100」三段式（那三段是**做不到精确 100%** 时的妥协）。
+- ★★ **中途改任务 ⇒ 条可以前进也可以后退**：加一项就平滑退回（1%/帧，让你**看见**任务变多了），
+  勾掉一项就往前冲；只有"新一轮"才吸附归零。
+- **`install_dsh_bridge.vbs` 只对 CLI 版 DSH 有效**：桌面版（Electron 打包版）**没有随包分发钩子桥接**
+  （`app.asar` 里 306 个 `@deepseek-ai` 包，没有一个名字带 `hook`）⇒ 安装器现在会**先查 asar**，
+  桌面版缺插件就**明确拒绝**并说明原因，不会再"装好了却没动静"。
+- **右键菜单「来源」里那档 `WorkBuddy` 改名 `AI`**（DSH / WorkBuddy 都算）。
+- 收尾"主人一动手就让位"的判据**同时认 DSH 的窗口**（原来只认 `workbuddy.exe`）。
+- 体检（`check_fairy.vbs`）多一段「DSH桥接」：钩子配置 / 事件流 / 桥接日志，一眼看出断在哪一段。
+- ★ 修掉一个只有"没有钩子"才会暴露的真 bug：桌宠重启后 `user_at` 恒为 0 ⇒ 冷启动判据把它
+  **锁死在常态、永不半睁**（之前靠 WorkBuddy 那路的旧数据顶着，属侥幸）。
+  现在用投影里的"这一轮开始时刻"顶替。
+- ★ 两个实测坑（都写进注释与文档了）：**钩子里必须用 `python.exe`**（`pythonw` 在 DSH 沙箱里静默失败）；
+  钩子的 stdin 可能到不了子进程 ⇒ 事件名走命令行参数。
+- 设计说明：[`docs/STEP21_DSH桥接与迁移.md`](docs/STEP21_DSH桥接与迁移.md) ·
+  [`docs/STEP22_阶段进度（todos投影）.md`](docs/STEP22_阶段进度（todos投影）.md)。
 
 ### v2.2（2026-09-28）
 

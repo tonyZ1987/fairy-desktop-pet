@@ -465,6 +465,189 @@ class ActivityWatch:
                                         a if a < 1e6 else -1, proj, self.skipped)
 
 
+# ============================================================================
+#  ★★★ 2026-10-19：多来源合并（**把"跟随 AI"从 WorkBuddy 扩展到 DSH**）
+#
+#  主人换了宿主（WorkBuddy → DeepSeek Harness），但他要的能力是同一件：
+#  **"我一发指令，Fairy 就半睁；AI 说完了，它自己睁眼"**。
+#  ⇒ 原来的 `ActivityWatch`（读 WorkBuddy 的 jsonl）**一行不动**，
+#    再并进来一个 `fairy_activity_dsh.DshActivityWatch`（读 DSH 的投影缓存 + 钩子事件流），
+#    由下面这层薄壳把两边**合成同一个接口** —— `fairy_pet` 只改一行（见 `make_watcher`）。
+#
+#  ★ 为什么用"合并"而不是"替换"：
+#    · 主人可能两边都在用（WorkBuddy 还没卸、DSH 是新的）⇒ 谁在干活就跟谁；
+#    · 任何一个源坏了 ⇒ 另一个照常工作（`active()` 是"或"，不是"与"）；
+#    · 哪天 WorkBuddy 彻底不用了，把 `make_watcher` 里那一条删掉即可，无损。
+# ============================================================================
+class MergeWatch(object):
+    u"""把多个感知器合成一个（接口与 `ActivityWatch` 一致：鸭子类型）。
+
+    语义：**任一方说"在干活"就算在干活**；`last_dir` 取**最近动过**的那一方
+    （多项目排队、进度条归属都靠它）；`per_proj` 合并成一张表给"任务还活着吗"用。
+    """
+
+    def __init__(self, parts=None):
+        self.parts = [p for p in (parts or []) if p is not None]
+        self.hint = u"init"
+        self.last_type = u""
+        self._hot = None            # 最近说话的那一方（`last_dir` 认它）
+        self._last_dir = u""
+
+    # ---- 只读聚合 ----
+    @property
+    def ok(self):
+        return any(bool(getattr(p, "ok", False)) for p in self.parts)
+
+    @property
+    def only(self):
+        out = []
+        for p in self.parts:
+            for x in (getattr(p, "only", None) or []):
+                if x not in out:
+                    out.append(x)
+        return out
+
+    @property
+    def skipped(self):
+        return sum(int(getattr(p, "skipped", 0) or 0) for p in self.parts)
+
+    @property
+    def user_at(self):
+        u"""最近一次"主人提交指令"的墙钟时刻（收尾让位要用）。"""
+        return max([float(getattr(p, "user_at", 0.0) or 0.0) for p in self.parts] or [0.0])
+
+    @property
+    def per_proj(self):
+        u"""`{项目名: 该项目最后一次活动的时刻}` —— 多项目排队的"还活着吗"判据。"""
+        out = {}
+        for p in self.parts:
+            for k, v in (getattr(p, "per_proj", None) or {}).items():
+                try:
+                    v = float(v)
+                except Exception:
+                    continue
+                if v > out.get(k, 0.0):
+                    out[k] = v
+        return out
+
+    @property
+    def last_dir(self):
+        u"""当前活跃项目的标识 —— **取最近动过的那一方**（而不是"第一个"）。
+
+        ★ 两边都有值时不能简单取第一个：WorkBuddy 的 `e-3D打印` 会一直躺在它的
+          感知里（`last_dir` 不会自动清空），若优先它，DSH 的进度条就会**认错项目**
+          （表现：条出现了但数字不动 / 条不出现）。⇒ 比 `last_act`。
+        """
+        best, best_at = None, -1e18
+        for p in self.parts:
+            if not getattr(p, "last_dir", ""):
+                continue
+            at = float(getattr(p, "last_act", 0.0) or 0.0)
+            if at > best_at:
+                best, best_at = p, at
+        if best is None:
+            return self._last_dir or u""
+        self._last_dir = getattr(best, "last_dir", u"") or u""
+        return self._last_dir
+
+    # ---- 活动判定 ----
+    def active(self, now=None):
+        u"""★ 必须**每一方都调一次**：`active()` 兼着刷新各自的时钟/保持窗口
+        （WorkBuddy 版的老坑：短路调用会让 `user_at` / `_hold_until` 停走）。"""
+        hit = False
+        for p in self.parts:
+            try:
+                if p.active(now):
+                    hit = True
+                    self._hot = p
+            except Exception:
+                continue
+        hot = self._hot if self._hot is not None else (self.parts[0] if self.parts else None)
+        if hot is not None:
+            self.hint = getattr(hot, "hint", u"")
+            self.last_type = getattr(hot, "last_type", u"")
+        return hit
+
+    def age(self, now=None):
+        u"""所有来源里**最近一次活动**距今多少秒（越小越新）。"""
+        vals = []
+        for p in self.parts:
+            try:
+                vals.append(float(p.age(now)))
+            except Exception:
+                continue
+        return min(vals) if vals else 1e9
+
+    def stage(self, now=None):
+        u"""→ 本轮**阶段进度**（`{percent, total, completed, active, label, project, …}` 或 None）。
+
+        ★ 这是 **DSH 独有**的事实源：把会话投影里的 `todos` 折算成百分比
+          （见 `fairy_activity_dsh.DshActivityWatch.stage` 的说明）。
+          WorkBuddy 没有这个源 ⇒ 那边没有 `stage()`，天然返回 None。
+        ★ 合并层只取"**第一个给出结论的**"：有就用，没有就当没有（绝不影响老逻辑）。
+        """
+        for p in self.parts:
+            fn = getattr(p, "stage", None)
+            if fn is None:
+                continue
+            try:
+                s = fn(now)
+            except Exception:
+                continue
+            if s:
+                return s
+        return None
+
+    def finished(self, now=None):
+        u"""→ **刚交付完**的那一轮（`{project, total, completed, turn, …}` 或 None）。
+
+        ★ 只有 DSH 有（`DshActivityWatch.finished`）：判据是
+          「这一轮关掉了（`openTurnStartSeq` 变空）+ `todos` 全部完成」——
+          用来做主人 2026-10-19 要的「**回复+交付完 ⇒ 进度正好 100% + 弹卡**」。
+        ★ 每条 `(sid, turn)` 只报一次 ⇒ 不会连弹两张卡。
+        """
+        for p in self.parts:
+            fn = getattr(p, "finished", None)
+            if fn is None:
+                continue
+            try:
+                s = fn(now)
+            except Exception:
+                continue
+            if s:
+                return s
+        return None
+
+    def info(self):
+        u"""心跳里那一行：每一方各自一段，用 ` + ` 隔开。"""
+        bits = []
+        for p in self.parts:
+            try:
+                bits.append(p.info())
+            except Exception:
+                bits.append(u"?")
+        return u" + ".join(bits) if bits else u"无来源"
+
+
+def make_watcher(only=None):
+    u"""→ 一个**合并**了所有 AI 宿主的感知器（DSH 优先，WorkBuddy 兜底）。
+
+    ★ `fairy_pet` 只调它一句，**不关心**现在跟的是哪个宿主。
+    ★ 任何一个模块 import 失败都只是"少了那一路"，绝不让桌宠起不来。
+    """
+    parts = []
+    try:
+        import fairy_activity_dsh as _D
+        parts.append(_D.DshActivityWatch(only=only))
+    except Exception as e:
+        print("[fairy] DSH 感知不可用（只跟 WorkBuddy）：%r" % (e,))
+    try:
+        parts.append(ActivityWatch(only=only))
+    except Exception as e:
+        print("[fairy] WorkBuddy 感知不可用：%r" % (e,))
+    return MergeWatch(parts)
+
+
 if __name__ == "__main__":
     w = ActivityWatch()
     print("root =", w.root, " 存在:", w.ok)

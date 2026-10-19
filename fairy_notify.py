@@ -131,7 +131,85 @@ def _env_project():
         if len(parts[0]) == 2 and parts[0][1] == u":":
             parts[0] = parts[0][0].lower()          # `C:` → `c`（与 `project_key()` 同规则）
         return u"-".join(parts)
+    # ★★★ 2026-10-19：**DSH 侧**的项目识别。
+    #   DSH 不会给工具调用注入 `CODEBUDDY_PROJECT_DIR` / `CLAUDE_PROJECT_DIR`
+    #   （那两个只在钩子进程里才有），但它**把工具的工作目录设为会话工作区**。
+    #   ★ 怎么认定"我现在在 DSH 里"：`DSH_SHELL` / `DSH_SESSION_ID` / `DSH_HOME`
+    #     任一个在（实测 DSH 的 pwsh 工具会带上整组 DSH_* 变量）。
+    #   ★★ 单靠 `cwd` 有一条真实会踩的坑（2026-10-19 原地验证）：
+    #      钩子/投影缓存报的项目是**会话工作区**（`E:\AI成图实践\Fairy` →
+    #      `e-AI成图实践-Fairy`），而 AI 若先 `cd` 到子目录再调本脚本，
+    #      反推出来的是 `e-AI成图实践-Fairy-pet-v2` ⇒ **两份进度文件、条不显示**。
+    #      ⇒ 三级判据：① `DSH_SESSION_ID` 在事件流里能查到对应项目；
+    #                  ② `cwd` 能直接对上"已知项目"（事件流 / 投影缓存里出现过）；
+    #                  ③ 否则**逐级往上找**，直到对上已知项目；
+    #                     都对不上才用 cwd 原样（宁可多写一份，也别什么都不写）。
+    #   ★ 认不出就不打标签（返回空串）—— 宁可少拦，不可误拦。
+    if (os.environ.get(u"DSH_SHELL") or os.environ.get(u"DSH_SESSION_ID")
+            or os.environ.get(u"DSH_HOME")):
+        return _dsh_project()
     return u""
+
+
+def _dsh_known():
+    u"""→ `(会话→项目 的表, 已知项目集合)`，来源 = DSH 钩子的事件流。
+
+    ★ 只读尾部 64 KB：事件流可能很长，而这里只关心"最近谁在哪个项目"。
+    ★ 任何异常都返回空表 —— 这条链只是"更准"，坏了也不能影响主流程。
+    """
+    sid2p, known = {}, set()
+    try:
+        import fairy_activity_dsh as _D
+        path = _D.EVENT_FILE
+        if not os.path.isfile(path):
+            return sid2p, known
+        size = os.path.getsize(path)
+        with open(path, u"rb") as f:
+            f.seek(max(0, size - 65536))
+            data = f.read()
+        for raw in data.split(b"\n"):
+            raw = raw.strip()
+            if not raw.startswith(b"{"):
+                continue
+            try:
+                d = json.loads(raw.decode(u"utf-8", u"replace"))
+            except Exception:
+                continue
+            p = d.get(u"p") or u""
+            if not p:
+                continue
+            known.add(p)
+            if d.get(u"s"):
+                sid2p[d[u"s"]] = p
+    except Exception:
+        pass
+    return sid2p, known
+
+
+def _dsh_project():
+    u"""DSH 下"我此刻属于哪个项目" —— 三级判据，见 `_env_project()` 的说明。"""
+    sid2p, known = _dsh_known()
+    sid = (os.environ.get(u"DSH_SESSION_ID") or u"").strip()
+    if sid and sid2p.get(sid):
+        return sid2p[sid]                      # ① 会话 id 精确命中
+    try:
+        import fairy_activity as _A
+    except Exception:
+        return u""
+    cwd = os.getcwd()
+    key = _A.project_key(cwd)
+    if key in known:
+        return key                             # ② cwd 直接对上
+    p = cwd
+    for _ in range(8):                         # ③ 逐级往上
+        parent = os.path.dirname(p)
+        if not parent or parent == p:
+            break
+        p = parent
+        k = _A.project_key(p)
+        if k in known:
+            return k
+    return key
 
 
 def current_project(ttl=2.0):
